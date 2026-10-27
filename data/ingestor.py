@@ -226,7 +226,12 @@ class HyperliquidIngestor:
             volume=float(data.get("v", 0)),
             interval=data.get("i", "1m"),
         )
-        self._state.candles_1m.append(candle)
+        # FIX #2: Deduplicar velas del mismo minuto (WS env\u00eda muchos updates por minuto)
+        if self._state.candles_1m and self._state.candles_1m[-1].timestamp_ms == candle.timestamp_ms:
+            self._state.candles_1m[-1] = candle   # reemplazar en lugar de duplicar
+        else:
+            self._state.candles_1m.append(candle)
+
 
         # Persistir en BD via Cola (Cold Path)
         self._db_worker._queue.put_nowait(DBEvent(

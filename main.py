@@ -166,20 +166,21 @@ async def main() -> None:
                                 )
 
                             # Registrar decisión en la BD para el Dashboard
+                            # FIX #1: Usar settings.trading_symbol y campos de la señal (no market_state.microstructure)
                             await db_worker.put(
                                 DBEvent(
                                     table="decisions",
                                     data={
-                                        "signal_id": getattr(signal, "signal_id", getattr(signal, "id", "")),
-                                        "symbol": getattr(signal, "symbol", settings.symbol),
+                                        "signal_id": getattr(signal, "signal_id", str(id(signal))),
+                                        "symbol": settings.trading_symbol,
                                         "strategy": signal.strategy,
                                         "side": signal.side.value if hasattr(signal.side, "value") else str(signal.side),
                                         "regime": signal.regime.value if hasattr(signal.regime, "value") else str(signal.regime),
-                                        "obi": market_state.microstructure.obi,
-                                        "cvd_1m": market_state.microstructure.cvd_1m,
-                                        "cvd_5m": market_state.microstructure.cvd_5m,
-                                        "basis_bps": market_state.microstructure.basis_bps,
-                                        "oi_change_5m": market_state.microstructure.oi_change_5m,
+                                        "obi": signal.obi,
+                                        "cvd_1m": signal.cvd_1m,
+                                        "cvd_5m": signal.cvd_5m,
+                                        "basis_bps": signal.basis_bps,
+                                        "oi_change_5m": signal.oi_change_5m,
                                         "proposed_price": approved.approved_price,
                                         "proposed_size": approved.approved_size,
                                         "stop_loss": approved.approved_stop_loss,
@@ -219,19 +220,19 @@ async def main() -> None:
                                 DBEvent(
                                     table="decisions",
                                     data={
-                                        "signal_id": getattr(signal, "signal_id", getattr(signal, "id", "")),
-                                        "symbol": getattr(signal, "symbol", settings.symbol),
+                                        "signal_id": getattr(signal, "signal_id", str(id(signal))),
+                                        "symbol": settings.trading_symbol,
                                         "strategy": signal.strategy,
                                         "side": signal.side.value if hasattr(signal.side, "value") else str(signal.side),
                                         "regime": signal.regime.value if hasattr(signal.regime, "value") else str(signal.regime),
-                                        "obi": market_state.microstructure.obi,
-                                        "cvd_1m": market_state.microstructure.cvd_1m,
-                                        "cvd_5m": market_state.microstructure.cvd_5m,
-                                        "basis_bps": market_state.microstructure.basis_bps,
-                                        "oi_change_5m": market_state.microstructure.oi_change_5m,
-                                        "proposed_price": getattr(signal, "proposed_price", getattr(signal, "entry_price", None)),
-                                        "proposed_size": getattr(signal, "size", None),
-                                        "stop_loss": getattr(signal, "stop_loss", None),
+                                        "obi": signal.obi,
+                                        "cvd_1m": signal.cvd_1m,
+                                        "cvd_5m": signal.cvd_5m,
+                                        "basis_bps": signal.basis_bps,
+                                        "oi_change_5m": signal.oi_change_5m,
+                                        "proposed_price": signal.proposed_price,
+                                        "proposed_size": None,
+                                        "stop_loss": signal.stop_loss,
                                         "shadow_mode": 1 if settings.shadow_mode else 0,
                                         "vetoed": 1,
                                         "veto_reason": str(veto),
@@ -243,16 +244,24 @@ async def main() -> None:
                 logger.exception("Error in signal evaluation loop")
 
     async def heartbeat_loop() -> None:
-        """Envía heartbeat a Telegram cada hora."""
+        """FIX #4: Actualiza BD cada 30s (watchdog MAX_HEARTBEAT_AGE_S=90).
+        Envía resumen a Telegram cada 3600s."""
+        telegram_interval = 3600
+        db_interval = 30
+        elapsed = 0
         while True:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(db_interval)
+            elapsed += db_interval
             try:
-                await alerter.send_heartbeat(
-                    market_state,
-                    state_machine.state.value,
-                )
-                # Actualizar heartbeat en BD
+                # Heartbeat en BD cada 30s para que el watchdog no marque frozen
                 await set_bot_state(db, BotProcessState.RUNNING)
+                # Alertar a Telegram solo cada hora
+                if elapsed >= telegram_interval:
+                    elapsed = 0
+                    await alerter.send_heartbeat(
+                        market_state,
+                        state_machine.state.value,
+                    )
             except Exception:
                 logger.exception("Heartbeat error")
 

@@ -255,10 +255,18 @@ class DatabaseWorker:
             sql = f"INSERT OR IGNORE INTO {event.table} ({cols}) VALUES ({placeholders})"
         elif event.event_type == "upsert":
             updates = ", ".join(f"{k} = excluded.{k}" for k in event.data.keys())
-            sql = (
-                f"INSERT INTO {event.table} ({cols}) VALUES ({placeholders}) "
-                f"ON CONFLICT DO UPDATE SET {updates}"
-            )
+            # FIX #3: SQLite requiere especificar el target de conflicto para upsert
+            if event.table == "candles_1m":
+                # candles_1m tiene UNIQUE en ts_ms
+                sql = (
+                    f"INSERT INTO {event.table} ({cols}) VALUES ({placeholders}) "
+                    f"ON CONFLICT(ts_ms) DO UPDATE SET {updates}"
+                )
+            else:
+                sql = (
+                    f"INSERT INTO {event.table} ({cols}) VALUES ({placeholders}) "
+                    f"ON CONFLICT DO UPDATE SET {updates}"
+                )
         else:
             raise ValueError(f"Unknown event_type: {event.event_type}")
 

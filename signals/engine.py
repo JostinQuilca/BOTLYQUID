@@ -55,16 +55,20 @@ def _ema(prices: list[float], period: int) -> float | None:
 
 
 def _rsi(prices: list[float], period: int = 14) -> float | None:
-    """RSI Wilder. Retorna valor 0-100."""
+    """RSI Wilder. Retorna valor 0-100.
+    FIX #5: Incluye deltas=0 en el promedio para que la división sea siempre
+    sobre `period` elementos y no sobre el conteo filtrado.
+    """
     if len(prices) < period + 1:
         return None
     deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-    gains = [d for d in deltas if d > 0]
-    losses = [-d for d in deltas if d < 0]
-    if not gains and not losses:
+    # Usa max() para preservar los ceros y mantener el promedio correcto
+    gains = [max(d, 0.0) for d in deltas[-period:]]
+    losses = [max(-d, 0.0) for d in deltas[-period:]]
+    if not any(gains) and not any(losses):
         return 50.0
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -468,8 +472,13 @@ class DecisionEngine:
 
         in_blackout, reason = self._regime_classifier.is_event_blackout()
         if in_blackout:
-            logger.info("Signal blocked: %s", reason)
-            return None
+            # FIX #6: En shadow mode NO bloqueamos la señal durante eventos (FOMC);
+            # solo la registramos para capturar datos del evento en modo simulación.
+            if self._shadow_mode:
+                logger.info("Shadow mode: blackout detectado (%s) — señal permitida para captura de datos", reason)
+            else:
+                logger.info("Signal blocked: %s", reason)
+                return None
 
         for strategy in self._strategies:
             signal = strategy.evaluate(state, snap, regime)
