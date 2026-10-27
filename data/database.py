@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS daily_risk (
 CREATE INDEX IF NOT EXISTS idx_candles_ts ON candles_1m(ts_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_cloid ON orders(cloid);
 CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_pnl_unique ON shadow_pnl(decision_id, horizon_label);
 """
 
 
@@ -202,6 +203,13 @@ class DatabaseWorker:
         except asyncio.QueueFull:
             logger.warning("DB queue full, dropping event for table=%s", event.table)
 
+    def enqueue(self, event: DBEvent) -> None:
+        """Encola sincrónicamente sin necesidad de await."""
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning("DB queue full, dropping event for table=%s", event.table)
+
     async def run(self) -> None:
         """
         Bucle principal del worker.
@@ -261,6 +269,15 @@ class DatabaseWorker:
                 sql = (
                     f"INSERT INTO {event.table} ({cols}) VALUES ({placeholders}) "
                     f"ON CONFLICT(ts_ms) DO UPDATE SET {updates}"
+                )
+            elif event.table == "daily_risk":
+                # daily_risk tiene UNIQUE en date_utc; preservar equity_open y actualizar pico
+                sql = (
+                    f"INSERT INTO daily_risk ({cols}) VALUES ({placeholders}) "
+                    f"ON CONFLICT(date_utc) DO UPDATE SET "
+                    f"equity_open = CASE WHEN daily_risk.equity_open <= 0 THEN excluded.equity_open ELSE daily_risk.equity_open END, "
+                    f"equity_peak = MAX(daily_risk.equity_peak, excluded.equity_peak), "
+                    f"updated_at = unixepoch('now', 'subsec')"
                 )
             else:
                 sql = (

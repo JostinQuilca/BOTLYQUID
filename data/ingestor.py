@@ -270,6 +270,12 @@ class HyperliquidIngestor:
         Reconcilia posición y órdenes en memoria contra el exchange cada 30s.
         Detecta discrepancias que indican pérdida de mensajes WebSocket.
         """
+        # Reconciliación inicial inmediata al arrancar (segundo 0)
+        try:
+            await self._reconcile_with_exchange()
+        except Exception:
+            logger.exception("Initial reconciliation failed")
+
         while self._running:
             await asyncio.sleep(self.RECONCILE_INTERVAL_S)
             try:
@@ -287,6 +293,7 @@ class HyperliquidIngestor:
         - Si es 0, lee USDC de spotClearinghouseState (Unified Account).
         """
         import httpx
+        from datetime import date
 
         url = self._settings.api_url + "/info"
         main_address = self._settings.hl_main_address
@@ -329,6 +336,25 @@ class HyperliquidIngestor:
         # Actualizar estado en memoria
         self._state.account.equity = equity
         self._state.account.available_margin = withdrawable
+
+        # Inicializar / actualizar daily_risk en BD para el Dashboard
+        if equity > 0:
+            today = date.today().isoformat()
+            self._db_worker.enqueue(
+                DBEvent(
+                    table="daily_risk",
+                    event_type="upsert",
+                    data={
+                        "date_utc": today,
+                        "equity_open": equity,
+                        "equity_peak": equity,
+                        "realized_pnl": 0.0,
+                        "unrealized_pnl": 0.0,
+                        "paused_until": None,
+                        "kill_switch": 0,
+                    },
+                )
+            )
 
         # ── Posición ───────────────────────────────────────────────────────────
         positions = state_data.get("assetPositions", [])

@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 # Fix Windows UTF-8 encoding for console output
@@ -294,6 +295,84 @@ async def main() -> None:
             except Exception:
                 logger.exception("Heartbeat error")
 
+    async def shadow_pnl_resolver_loop() -> None:
+        """
+        Resuelve el PnL virtual (shadow_pnl) para decisiones en modo sombra.
+        Corre cada 30s. Para cada decisión aprobada (vetoed=0, shadow_mode=1),
+        evalúa horizontes de 5m (300s), 15m (900s) y 1h (3600s).
+        Calcula pnl_pct e inserta la fila en shadow_pnl para el Dashboard.
+        """
+        horizons = [
+            ("5m", 300),
+            ("15m", 900),
+            ("1h", 3600),
+        ]
+        while True:
+            await asyncio.sleep(30)
+            try:
+                rows = await db.execute_fetchall(
+                    """
+                    SELECT id, side, proposed_price, created_at
+                    FROM decisions
+                    WHERE vetoed = 0 AND shadow_mode = 1
+                      AND proposed_price IS NOT NULL AND proposed_price > 0
+                    ORDER BY id ASC
+                    """
+                )
+                if not rows:
+                    continue
+
+                existing_rows = await db.execute_fetchall(
+                    "SELECT decision_id, horizon_label FROM shadow_pnl"
+                )
+                existing = {(r[0], r[1]) for r in existing_rows}
+
+                now = time.time()
+                current_price = (
+                    market_state.asset_ctx.mark_price
+                    or (market_state.candles_1m[-1].close if market_state.candles_1m else None)
+                    or (market_state.l2_book.mid_price if market_state.l2_book else None)
+                )
+                if not current_price or current_price <= 0:
+                    continue
+
+                for dec_id, side, entry_price, created_at in rows:
+                    age_s = now - created_at
+                    for label, duration_s in horizons:
+                        if (dec_id, label) in existing:
+                            continue
+                        if age_s >= duration_s:
+                            target_ts_ms = int((created_at + duration_s) * 1000)
+                            exit_price = current_price
+                            matching_candles = [
+                                c for c in market_state.candles_1m
+                                if abs(c.timestamp_ms - target_ts_ms) <= 60000
+                            ]
+                            if matching_candles:
+                                exit_price = matching_candles[0].close
+
+                            if str(side).upper() == "BUY":
+                                pnl_pct = (exit_price - entry_price) / entry_price
+                            else:
+                                pnl_pct = (entry_price - exit_price) / entry_price
+
+                            await db.execute(
+                                """
+                                INSERT OR IGNORE INTO shadow_pnl
+                                (decision_id, horizon_label, entry_price, exit_price, pnl_pct, resolved_at)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                                """,
+                                (dec_id, label, entry_price, exit_price, pnl_pct, now),
+                            )
+                            await db.commit()
+                            existing.add((dec_id, label))
+                            logger.info(
+                                "Shadow PnL resuelto: Decisión #%d (%s) [%s] Entry=%.2f Exit=%.2f PnL=%+.4f%%",
+                                dec_id, side, label, entry_price, exit_price, pnl_pct * 100,
+                            )
+            except Exception:
+                logger.exception("Error en shadow_pnl_resolver_loop")
+
     # ── 7. Arrancar todo ───────────────────────────────────────────────────────
     logger.info("Starting all async tasks...")
 
@@ -342,6 +421,7 @@ async def main() -> None:
             asyncio.create_task(ext_signals.run(), name="external_signals"),
             asyncio.create_task(signal_evaluation_loop(), name="signal_loop"),
             asyncio.create_task(heartbeat_loop(), name="heartbeat"),
+            asyncio.create_task(shadow_pnl_resolver_loop(), name="shadow_pnl_resolver"),
             asyncio.create_task(telegram_loop(), name="telegram"),
         ]
 
