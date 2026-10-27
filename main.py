@@ -170,10 +170,10 @@ async def main() -> None:
                                 DBEvent(
                                     table="decisions",
                                     data={
-                                        "signal_id": signal.id,
-                                        "symbol": signal.symbol,
+                                        "signal_id": getattr(signal, "signal_id", getattr(signal, "id", "")),
+                                        "symbol": getattr(signal, "symbol", settings.symbol),
                                         "strategy": signal.strategy,
-                                        "side": signal.side.value,
+                                        "side": signal.side.value if hasattr(signal.side, "value") else str(signal.side),
                                         "regime": signal.regime.value if hasattr(signal.regime, "value") else str(signal.regime),
                                         "obi": market_state.microstructure.obi,
                                         "cvd_1m": market_state.microstructure.cvd_1m,
@@ -194,7 +194,7 @@ async def main() -> None:
                                 logger.info(
                                     "SHADOW SIGNAL: %s %s @ %.2f (SL=%.2f) [F&G=%d, Funding=%+.4f%%]",
                                     signal.strategy,
-                                    signal.side.value,
+                                    signal.side.value if hasattr(signal.side, "value") else str(signal.side),
                                     approved.approved_price,
                                     approved.approved_stop_loss,
                                     ext.fng_value,
@@ -202,7 +202,7 @@ async def main() -> None:
                                 )
                                 await alerter.send(
                                     f"👻 *Shadow Signal*\n"
-                                    f"`{signal.strategy}` {signal.side.value}\n"
+                                    f"`{signal.strategy}` {signal.side.value if hasattr(signal.side, 'value') else signal.side}\n"
                                     f"Entry: `${approved.approved_price:,.2f}`\n"
                                     f"SL: `${approved.approved_stop_loss:,.2f}`\n"
                                     f"Size: `{approved.approved_size:.5f} BTC`\n"
@@ -219,17 +219,17 @@ async def main() -> None:
                                 DBEvent(
                                     table="decisions",
                                     data={
-                                        "signal_id": signal.id,
-                                        "symbol": signal.symbol,
+                                        "signal_id": getattr(signal, "signal_id", getattr(signal, "id", "")),
+                                        "symbol": getattr(signal, "symbol", settings.symbol),
                                         "strategy": signal.strategy,
-                                        "side": signal.side.value,
+                                        "side": signal.side.value if hasattr(signal.side, "value") else str(signal.side),
                                         "regime": signal.regime.value if hasattr(signal.regime, "value") else str(signal.regime),
                                         "obi": market_state.microstructure.obi,
                                         "cvd_1m": market_state.microstructure.cvd_1m,
                                         "cvd_5m": market_state.microstructure.cvd_5m,
                                         "basis_bps": market_state.microstructure.basis_bps,
                                         "oi_change_5m": market_state.microstructure.oi_change_5m,
-                                        "proposed_price": getattr(signal, "entry_price", None),
+                                        "proposed_price": getattr(signal, "proposed_price", getattr(signal, "entry_price", None)),
                                         "proposed_size": getattr(signal, "size", None),
                                         "stop_loss": getattr(signal, "stop_loss", None),
                                         "shadow_mode": 1 if settings.shadow_mode else 0,
