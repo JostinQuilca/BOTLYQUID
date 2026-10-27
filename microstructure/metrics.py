@@ -314,6 +314,11 @@ class VolatilityTracker:
         atr_5m = self._atr(list(state.candles_1m)[-5:]) if len(state.candles_1m) >= 5 else None
         atr_1h = self._atr(list(state.candles_1m)[-60:]) if len(state.candles_1m) >= 60 else None
 
+        # FIX #2 fallback: si atr_1h no disponible todavía (< 60 velas), usar atr_5m
+        # como aproximación para que las estrategias no queden bloqueadas al reiniciar
+        if atr_1h is None and atr_5m is not None:
+            atr_1h = atr_5m
+
         vwap = self._session_vwap(state) if state.candles_1m else None
         dist = None
         if vwap and price and vwap > 0:
@@ -327,6 +332,7 @@ class VolatilityTracker:
             current_price=price or 0.0,
             computed_at=time.monotonic(),
         )
+
 
     @staticmethod
     def _atr(candles: list) -> float | None:

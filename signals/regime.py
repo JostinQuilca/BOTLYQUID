@@ -113,11 +113,26 @@ class RegimeClassifier:
 
         self._last_eval_at = now
 
-        # Chequear si estamos en blackout de evento
+        # FIX #1: Durante blackout de evento, NO forzar MODO_EVENTO.
+        # El motor ya decide si bloquear o no según shadow_mode (en engine.py).
+        # Aquí solo clasificamos el régimen real para que las estrategias funcionen.
         in_blackout, reason = self.is_event_blackout()
         if in_blackout:
-            logger.info("Regime → MODO_EVENTO (%s)", reason)
-            self._force_regime(MarketRegime.MODO_EVENTO)
+            proposed = self._classify(state, snapshot)
+            logger.info(
+                "Blackout activo (%s) — régimen calculado normalmente: %s",
+                reason, proposed.value,
+            )
+            # Aplicar histéresis igual que en modo normal
+            if proposed == self._pending_regime:
+                self._pending_count += 1
+            else:
+                self._pending_regime = proposed
+                self._pending_count = 1
+            if self._pending_count >= self.CONFIRM_COUNT:
+                self._current_regime = proposed
+                self._pending_regime = None
+                self._pending_count = 0
             return self._current_regime
 
         # Clasificar régimen propuesto

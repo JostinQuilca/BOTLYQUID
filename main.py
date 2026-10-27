@@ -71,6 +71,35 @@ async def main() -> None:
         "shadow_mode": settings.shadow_mode,
     })
 
+    # FIX #2: Precargar velas históricas desde SQLite al arrancar
+    # Evita esperar 60 min para que atr_1h sea válido (TrendMomentum requiere 55 velas)
+    try:
+        from data.state import Candle as _Candle
+        rows = await db.execute_fetchall(
+            "SELECT ts_ms, open, high, low, close, volume "
+            "FROM candles_1m WHERE symbol=? ORDER BY ts_ms DESC LIMIT 240",
+            (settings.trading_symbol,),
+        )
+        if rows:
+            for row in reversed(rows):
+                market_state.candles_1m.append(_Candle(
+                    timestamp_ms=row[0],
+                    open=row[1],
+                    high=row[2],
+                    low=row[3],
+                    close=row[4],
+                    volume=row[5],
+                    interval="1m",
+                ))
+            logger.info(
+                "Precargadas %d velas desde SQLite (bot listo en segundos)",
+                len(rows),
+            )
+        else:
+            logger.info("Sin velas hist\u00f3ricas en BD — esperando datos del WebSocket")
+    except Exception:
+        logger.exception("Error precargando velas desde SQLite (no cr\u00edtico)")
+
     # ── 2. DatabaseWorker (Cold Path) ──────────────────────────────────────────
     db_worker = DatabaseWorker(db)
 
@@ -271,6 +300,7 @@ async def main() -> None:
     try:
         async def telegram_loop() -> None:
             """Arranca Telegram con reintentos infinitos — nunca bloquea el bot principal."""
+            nonlocal alerter   # FIX #3: vincular alerter al scope externo
             import telegram.error
             attempt = 0
             while True:
@@ -284,6 +314,7 @@ async def main() -> None:
                 try:
                     await _app.initialize()
                     await _app.start()
+                    alerter = _alerter   # FIX #3: actualizar referencia tras initialize()
                     logger.info("Telegram bot @CriptoLiquidBot activo (intento %d)", attempt)
                     await _app.updater.start_polling(drop_pending_updates=True)
                     return  # polling terminó limpiamente
