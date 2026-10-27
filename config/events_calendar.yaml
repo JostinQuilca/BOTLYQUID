@@ -1,0 +1,39 @@
+# config/events_calendar.yaml
+# Calendario de eventos de alto impacto — Bloqueados 30min antes, 60min después
+
+events:
+  # FOMC Octubre 2026
+  - name: "FOMC Decision - Octubre 2026"
+    datetime_utc: "2026-10-28T18:00:00"
+    impact: "HIGH"
+    notes: "Federal Reserve interest rate decision"
+
+  # FOMC Powell Press Conference
+  - name: "FOMC Powell Press Conference"
+    datetime_utc: "2026-10-28T18:30:00"
+    impact: "HIGH"
+    notes: "Jerome Powell press conference post-FOMC"
+
+  # Vencimiento de Opciones BTC (30 oct)
+  - name: "BTC Options Expiry - $12.1B"
+    datetime_utc: "2026-10-30T08:00:00"
+    impact: "HIGH"
+    notes: "Major BTC options expiry - $12.1B notional"
+
+  # IPC USA (Noviembre)
+  - name: "US CPI November 2026"
+    datetime_utc: "2026-11-12T13:30:00"
+    impact: "HIGH"
+    notes: "US Consumer Price Index"
+
+  # FOMC Noviembre 2026
+  - name: "FOMC Decision - Noviembre 2026"
+    datetime_utc: "2026-11-19T19:00:00"
+    impact: "HIGH"
+    notes: "Federal Reserve meeting"
+
+  # NFP (Non-Farm Payrolls) Noviembre
+  - name: "US Non-Farm Payrolls November"
+    datetime_utc: "2026-11-06T13:30:00"
+    impact: "MEDIUM"
+    notes: "US employment data"

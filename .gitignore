@@ -1,0 +1,29 @@
+.env
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Datos y logs
+data/parquet/
+data/db/
+*.db
+*.db-wal
+*.db-shm
+*.parquet
+logs/
+
+# Kill switch flag
+STOP_BOT.flag
+
+# IDE
+.vscode/
+.idea/
+*.swp
