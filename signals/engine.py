@@ -443,7 +443,7 @@ class DecisionEngine:
         self._shadow_mode = shadow_mode
         self._regime_classifier = RegimeClassifier()
         self._strategies = [
-            TrendMomentum(),           # Nueva estrategia primero
+            # TrendMomentum(),  # <-- DESACTIVADA TEMPORALMENTE (Bajo Win Rate en backtest)
             AbsorptionMeanReversion(),
             VolatilityBreakout(),
         ]
