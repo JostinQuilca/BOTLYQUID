@@ -63,8 +63,8 @@ class RiskValidator:
     """
 
     # Umbrales de salud del sistema
-    MAX_TICK_AGE_MS = 3_000
-    MAX_CLOCK_SKEW_MS = 1_000
+    MAX_TICK_AGE_MS = 5_000
+    MAX_CLOCK_SKEW_MS = 5_000
 
     # Reglas de microestructura
     MAX_PRICE_DEVIATION_BPS = 20    # 0.2% del mid price
@@ -315,6 +315,12 @@ class RiskValidator:
             )
 
         raw_size = risk_amount_usd / distance_usd
+
+        # Limitar al tamaño máximo permitido por apalancamiento
+        if not self._shadow_mode and self._settings.max_leverage > 0 and signal.proposed_price > 0:
+            max_allowed_size = (equity * self._settings.max_leverage) / signal.proposed_price
+            if raw_size > max_allowed_size:
+                raw_size = max_allowed_size
 
         # Redondear a szDecimals (floor para no exceder el riesgo)
         factor = 10 ** self._sz_decimals
