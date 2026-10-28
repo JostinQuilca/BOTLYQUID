@@ -16,10 +16,12 @@ build/
 # Datos y logs
 data/parquet/
 data/db/
+data/exports/
 *.db
 *.db-wal
 *.db-shm
 *.parquet
+*.xlsx
 logs/
 
 # Kill switch flag
