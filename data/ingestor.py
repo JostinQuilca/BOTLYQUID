@@ -314,22 +314,22 @@ class HyperliquidIngestor:
             })
             spot_data = spot_resp.json() if spot_resp.status_code == 200 else {}
 
-        # ── Equity: perps primero, spot USDC como fallback ─────────────────────
-        equity = float(
+        # ── Equity (Unified Account) ──────────────────────────────────────────
+        # En Hyperliquid Unified Account, el balance total de la cuenta es el USDC de Spot.
+        # Cuando se abre una posición, parte del balance se asigna temporalmente a perps
+        # (marginSummary.accountValue), por lo que leer solo perps causaba una falsa caída del 60%.
+        spot_balances = spot_data.get("balances", []) if isinstance(spot_data, dict) else []
+        spot_usdc = next(
+            (float(b["total"]) for b in spot_balances if b.get("coin") == "USDC"),
+            0.0,
+        )
+        perp_account_val = float(
             state_data.get("marginSummary", {}).get("accountValue", 0)
         )
-        if equity == 0.0:
-            # Unified Account: el USDC en spot ES el margen disponible
-            spot_balances = spot_data.get("balances", [])
-            spot_usdc = next(
-                (float(b["total"]) for b in spot_balances if b.get("coin") == "USDC"),
-                0.0,
-            )
-            if spot_usdc > 0:
-                equity = spot_usdc
-                logger.debug(
-                    "Unified Account: using spot USDC %.4f as equity", equity
-                )
+        if spot_usdc > 0:
+            equity = spot_usdc
+        else:
+            equity = perp_account_val
 
         withdrawable = float(state_data.get("withdrawable", equity))
 

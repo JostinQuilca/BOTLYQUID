@@ -322,9 +322,31 @@ class RiskValidator:
             if raw_size > max_allowed_size:
                 raw_size = max_allowed_size
 
-        # Redondear a szDecimals (floor para no exceder el riesgo)
+        # Redondear a szDecimals — usar round() en lugar de floor() para cuentas pequeñas.
+        # math.floor redondea 0.00012 → 0.0001 (válido) pero también 0.000049 → 0.0000
+        # con round(), el tamaño mínimo posible es 0.0001 BTC (szDecimals=4).
         factor = 10 ** self._sz_decimals
-        size = math.floor(raw_size * factor) / factor
+        size = round(raw_size * factor) / factor
+
+        # Si el round() subió el size y ahora excede max leverage, bajar un tick
+        if not self._shadow_mode and self._settings.max_leverage > 0 and signal.proposed_price > 0:
+            max_lev_size = (equity * self._settings.max_leverage) / signal.proposed_price
+            if size > max_lev_size:
+                size = math.floor(raw_size * factor) / factor
+                logger.info(
+                    "Size ajustado de round→floor para no exceder leverage: %.5f BTC",
+                    size,
+                )
+
+        # Si después de redondear el size sigue siendo 0, usar el mínimo absoluto permitido
+        if size <= 0:
+            min_size = 1 / factor  # e.g. 0.0001 BTC para szDecimals=4
+            logger.warning(
+                "Size redondeado a 0 (raw_size=%.8f). Usando tamaño mínimo: %.4f BTC",
+                raw_size,
+                min_size,
+            )
+            size = min_size
 
         # Verificar nocional mínimo — reducido a $1 para cuentas pequeñas
         min_notional = max(1.0, self._min_notional_usd * 0.1) if self._shadow_mode else self._min_notional_usd

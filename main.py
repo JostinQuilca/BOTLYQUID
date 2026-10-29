@@ -242,6 +242,29 @@ async def main() -> None:
                                     alert_type="SIGNAL",
                                 )
                             elif executor:
+                                side_str = signal.side.value if hasattr(signal.side, "value") else str(signal.side)
+                                side_emoji = "🟢" if side_str == "BUY" else "🔴"
+                                logger.info(
+                                    "LIVE SIGNAL: %s %s @ %.2f (SL=%.2f, Size=%.5f BTC) [F&G=%d, Funding=%+.4f%%]",
+                                    signal.strategy,
+                                    side_str,
+                                    approved.approved_price,
+                                    approved.approved_stop_loss,
+                                    approved.approved_size,
+                                    ext.fng_value,
+                                    ext.binance_funding_8h_pct,
+                                )
+                                await alerter.send(
+                                    f"🚀 *LIVE ORDER ENVIADA*\n"
+                                    f"{side_emoji} `{signal.strategy}` {side_str}\n"
+                                    f"Entry: `${approved.approved_price:,.2f}`\n"
+                                    f"SL: `${approved.approved_stop_loss:,.2f}`\n"
+                                    f"Size: `{approved.approved_size:.5f} BTC` (~${approved.approved_size * approved.approved_price:.2f})\n"
+                                    f"Type: `{signal.order_type.value if hasattr(signal.order_type, 'value') else signal.order_type}`\n"
+                                    f"Fear&Greed: `{ext.fng_value}` ({ext.fng_label})\n"
+                                    f"Funding: `{ext.binance_funding_8h_pct:+.4f}%`/8h",
+                                    alert_type="SIGNAL",
+                                )
                                 await executor.execute(approved)
 
                         except Exception as veto:

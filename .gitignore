@@ -24,8 +24,9 @@ data/exports/
 *.xlsx
 logs/
 
-# Kill switch flag
+# Kill switch flag & runtime
 STOP_BOT.flag
+.boot_epoch
 
 # IDE
 .vscode/

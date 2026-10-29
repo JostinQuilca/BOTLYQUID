@@ -16,11 +16,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import time
 from typing import Any
 
 from config.settings import get_boot_epoch, get_settings
 from execution.state_machine import ExecutorState, ExecutorStateMachine, InvalidTransitionError
+from hyperliquid.utils.types import Cloid
 from signals.schemas import ApprovedOrder, OrderType, SignalSide
 
 logger = logging.getLogger(__name__)
@@ -91,7 +93,9 @@ class HyperliquidExecutor:
         Formato: hex de 32 chars (128 bits)
         """
         seed = f"{signal_id}:{self._boot_epoch}:{self._symbol}"
-        return hashlib.sha256(seed.encode()).hexdigest()[:32]
+        # El SDK de Hyperliquid requiere Cloid con prefijo 0x y exactamente 32 hex chars (16 bytes)
+        hex32 = hashlib.sha256(seed.encode()).hexdigest()[:32]
+        return Cloid(f"0x{hex32}")
 
     # ── Ejecución de señal ─────────────────────────────────────────────────────
 
@@ -140,16 +144,31 @@ class HyperliquidExecutor:
         signal = approved.signal
         is_buy = signal.side == SignalSide.BUY
 
+        # En BTC en Hyperliquid el tick size es 1.0 (número entero).
+        # Para ALO (post-only/maker):
+        # BUY -> floor (para no cruzar hacia arriba con el ask)
+        # SELL -> ceil (para no cruzar hacia abajo con el bid)
+        if self._symbol == "BTC":
+            order_px = float(math.floor(approved.approved_price) if is_buy else math.ceil(approved.approved_price))
+        else:
+            order_px = round(approved.approved_price, 2)
+
         try:
             result = self._exchange.order(
                 self._symbol,
                 is_buy,
                 approved.approved_size,
-                approved.approved_price,
+                order_px,
                 {"limit": {"tif": "Alo"}},
-                cloid=cloid,
+                cloid=cloid,  # ya es un objeto Cloid
             )
-            logger.debug("ALO order result: %s", result)
+            logger.info("ALO order result from exchange: %s (px=%.1f)", result, order_px)
+            if isinstance(result, dict) and result.get("status") == "err":
+                raise RuntimeError(f"Exchange error: {result.get('response')}")
+            statuses = result.get("response", {}).get("data", {}).get("statuses", []) if isinstance(result, dict) else []
+            for st in statuses:
+                if isinstance(st, dict) and "error" in st:
+                    raise RuntimeError(f"Order rejected by exchange: {st['error']}")
 
             # Esperar fill con timeout
             try:
@@ -173,16 +192,27 @@ class HyperliquidExecutor:
         signal = approved.signal
         is_buy = signal.side == SignalSide.BUY
 
+        if self._symbol == "BTC":
+            order_px = float(round(approved.approved_price))
+        else:
+            order_px = round(approved.approved_price, 2)
+
         try:
             result = self._exchange.order(
                 self._symbol,
                 is_buy,
                 approved.approved_size,
-                approved.approved_price,
+                order_px,
                 {"limit": {"tif": "Ioc"}},
-                cloid=cloid,
+                cloid=cloid,  # ya es un objeto Cloid
             )
-            logger.debug("IOC order result: %s", result)
+            logger.info("IOC order result from exchange: %s (px=%.1f)", result, order_px)
+            if isinstance(result, dict) and result.get("status") == "err":
+                raise RuntimeError(f"Exchange error: {result.get('response')}")
+            statuses = result.get("response", {}).get("data", {}).get("statuses", []) if isinstance(result, dict) else []
+            for st in statuses:
+                if isinstance(st, dict) and "error" in st:
+                    raise RuntimeError(f"Order rejected by exchange: {st['error']}")
 
         except Exception as e:
             await self._handle_order_error(e, "IOC entry")
@@ -229,6 +259,10 @@ class HyperliquidExecutor:
         # Obtener stop price de la orden aprobada (guardada en estado)
         # En producción se recupera del DecisionLog o del ApprovedOrder activo
         stop_price = self._get_active_stop_loss_price(entry_price)
+        if self._symbol == "BTC":
+            stop_price = float(round(stop_price))
+        else:
+            stop_price = round(stop_price, 2)
         is_buy_position = entry_price > 0   # Simplificado; en prod leer del state_machine
 
         for attempt in range(1, self.SL_MAX_RETRIES + 1):
