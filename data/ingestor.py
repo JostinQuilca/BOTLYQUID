@@ -301,7 +301,20 @@ class HyperliquidIngestor:
                 )
 
                 # Si es apertura, notificar a executor
-                if "Open" in dir_str and self._executor:
+                # FIX #C: "Open" in dir_str no cubre todos los casos (ej.: un
+                # flip de posición puede venir como "Long > Short"/"Short > Long"
+                # sin la palabra "Open"). Usamos como señal adicional, y más
+                # confiable, nuestro propio estado: si el executor está en
+                # ENTRY_PENDING es porque ESTAMOS esperando que llene nuestra
+                # orden de entrada, así que cualquier fill que llegue en ese
+                # momento es, por definición, el fill de apertura que buscamos.
+                from execution.state_machine import ExecutorState
+                executor_awaiting_entry = (
+                    self._executor is not None
+                    and getattr(self._executor, "_sm", None) is not None
+                    and self._executor._sm.state == ExecutorState.ENTRY_PENDING
+                )
+                if ("Open" in dir_str or executor_awaiting_entry) and self._executor:
                     active_cloid = getattr(self._executor, "_active_entry_cloid", None)
                     await self._executor.on_fill(active_cloid, px, sz, oid)
 
@@ -494,6 +507,31 @@ class HyperliquidIngestor:
                 from execution.state_machine import ExecutorState
                 if self._executor._sm.state in (ExecutorState.OPEN_PROTECTED, ExecutorState.OPEN_UNPROTECTED):
                     await self._executor.on_position_closed("Reconcile: position is 0 on exchange")
+
+        # FIX #B: hay posición real abierta pero le falta TP y/o SL en el
+        # exchange. Antes esto solo se guardaba para el dashboard y no se
+        # corregía nunca — si se perdió el fill original, la posición podía
+        # quedar desprotegida indefinidamente. Ahora el reconciliador se
+        # auto-sana recolocando las órdenes de protección.
+        elif (active_tp <= 0.0 or active_sl <= 0.0) and self._executor:
+            logger.critical(
+                "RECONCILE: posición abierta (%.6f @ %.2f) SIN protección completa "
+                "(TP=%.1f, SL=%.1f). Recolocando automáticamente.",
+                real_pos, entry_px, active_tp, active_sl,
+            )
+            if self._alerter:
+                await self._alerter.send(
+                    f"🚨 *POSICIÓN DESPROTEGIDA DETECTADA*\n"
+                    f"Tamaño: `{real_pos:.5f} BTC` @ `${entry_px:,.2f}`\n"
+                    f"TP activo: `${active_tp:,.2f}`\n"
+                    f"SL activo: `${active_sl:,.2f}`\n"
+                    f"Recolocando órdenes de protección ahora...",
+                    alert_type="CRITICAL",
+                )
+            try:
+                await self._executor.ensure_protected(entry_px, abs(real_pos))
+            except Exception:
+                logger.exception("Fallo al recolocar SL/TP desde el reconciliador")
 
         # ── 4. Sincronizar fills recientes desde REST (resiliencia) ───────────
         try:

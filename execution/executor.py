@@ -79,6 +79,9 @@ class HyperliquidExecutor:
         self._fill_event = asyncio.Event()
         self._last_modify_at: float = 0.0
         self._kill_switch_active = False
+        self._protect_lock = asyncio.Lock()  # FIX: evita colocar SL/TP en paralelo
+                                              # si on_fill() y ensure_protected()
+                                              # (reconciliador) se disparan a la vez
 
         # Monitorear archivo STOP_BOT.flag
         asyncio.get_event_loop().create_task(self._monitor_kill_flag())
@@ -271,14 +274,97 @@ class HyperliquidExecutor:
 
         self._fill_event.set()
 
-        # Transicionar a OPEN_UNPROTECTED (posición real sin SL/TP aún)
-        await self._sm.transition(
-            ExecutorState.OPEN_UNPROTECTED,
-            f"fill @ {fill_price:.2f}",
-        )
+        # FIX #A: el fill puede llegar cuando el estado YA NO es ENTRY_PENDING
+        # (ej.: el timeout de 15s de la ALO ya hizo ENTRY_PENDING -> FLAT justo
+        # antes de que llegara este evento tardío del WebSocket). Antes, la
+        # transición directa a OPEN_UNPROTECTED fallaba con InvalidTransitionError,
+        # esa excepción se perdía en el logger.exception() de _message_loop(), y
+        # _place_tp_sl_with_retry() NUNCA se ejecutaba: la posición quedaba real
+        # y abierta en el exchange, pero completamente desprotegida.
+        try:
+            if self._sm.state == ExecutorState.FLAT:
+                logger.warning(
+                    "Fill llegó con estado FLAT (probable timeout/race de la ALO). "
+                    "Recuperando estado antes de proteger la posición."
+                )
+                await self._sm.transition(
+                    ExecutorState.ENTRY_PENDING,
+                    "late fill recovery",
+                )
+            await self._sm.transition(
+                ExecutorState.OPEN_UNPROTECTED,
+                f"fill @ {fill_price:.2f}",
+            )
+        except InvalidTransitionError as e:
+            # No debería pasar nunca, pero si pasa: la posición YA existe en el
+            # exchange. Proteger la posición real importa más que la limpieza
+            # del estado interno, así que seguimos adelante igual.
+            logger.critical(
+                "Estado inconsistente tras un fill real (%s). "
+                "Colocando SL/TP de todas formas para no dejar la posición desnuda.",
+                e,
+            )
+            if self._alerter:
+                await self._alerter.send(
+                    f"⚠️ *ESTADO INCONSISTENTE TRAS FILL*\n"
+                    f"Fill real: `{fill_size:.5f} BTC @ ${fill_price:,.2f}`\n"
+                    f"Estado interno: `{self._sm.state.value}`\n"
+                    f"Colocando SL/TP de todos modos...",
+                    alert_type="CRITICAL",
+                )
 
         # Colocar Stop Loss y Take Profit automáticamente
-        await self._place_tp_sl_with_retry(fill_price, fill_size)
+        async with self._protect_lock:
+            await self._place_tp_sl_with_retry(fill_price, fill_size)
+
+    # ── Auto-sanación (llamado por el reconciliador) ──────────────────────────
+
+    async def ensure_protected(self, entry_price: float, size: float) -> None:
+        """
+        FIX #B: verifica/fuerza que la posición real actual tenga SL y TP en
+        el exchange. Pensado para ser llamado por el reconciliador REST cuando
+        detecta una posición abierta sin protección completa — por ejemplo si
+        se perdió el evento de fill del WebSocket, o si el proceso se reinició
+        con una posición ya abierta en el exchange.
+
+        Antes, el reconciliador detectaba `active_tp == 0` / `active_sl == 0`
+        con una posición real abierta, lo dejaba en los logs/dashboard, y no
+        hacía NADA para corregirlo: la posición podía quedar desprotegida
+        indefinidamente.
+        """
+        if self._kill_switch_active:
+            logger.info("ensure_protected: kill switch activo, no se protege")
+            return
+
+        if self._sm.state == ExecutorState.OPEN_PROTECTED:
+            return  # ya protegida, nada que hacer
+
+        logger.critical(
+            "RECONCILE: posición real de %.6f %s SIN protección completa detectada "
+            "(entry=%.2f). Forzando colocación de SL/TP.",
+            size, self._symbol, entry_price,
+        )
+
+        # Llevar el estado a uno desde el que VALID_TRANSITIONS permita llegar
+        # a OPEN_PROTECTED (ver execution/state_machine.py). Si el proceso se
+        # reinició, lo normal es partir de FLAT sin saber nada de esta posición.
+        try:
+            if self._sm.state == ExecutorState.FLAT:
+                await self._sm.transition(
+                    ExecutorState.ENTRY_PENDING, "reconcile: unprotected position found"
+                )
+            if self._sm.state == ExecutorState.ENTRY_PENDING:
+                await self._sm.transition(
+                    ExecutorState.OPEN_UNPROTECTED, "reconcile: unprotected position found"
+                )
+        except InvalidTransitionError as e:
+            logger.critical(
+                "No se pudo preparar la máquina de estados para proteger la "
+                "posición (%s). Se intenta igual colocar SL/TP.", e,
+            )
+
+        async with self._protect_lock:
+            await self._place_tp_sl_with_retry(entry_price, size)
 
     async def _place_tp_sl_with_retry(
         self,
@@ -289,6 +375,12 @@ class HyperliquidExecutor:
         Coloca AUTOMÁTICAMENTE el Stop Loss y el Take Profit en Hyperliquid.
         Lee los precios aprobados de la estrategia sin necesidad de usar el lápiz.
         """
+        # FIX: idempotencia — si entre que se decidió llamar a esta función y que
+        # se ejecuta ya quedó protegida (por una llamada concurrente), no duplicar
+        # las órdenes de SL/TP en el exchange.
+        if self._sm.state == ExecutorState.OPEN_PROTECTED:
+            logger.debug("_place_tp_sl_with_retry: ya protegida, nada que hacer")
+            return
         if self._active_order is None:
             is_buy_position = True
             stop_price = entry_price * 0.985
