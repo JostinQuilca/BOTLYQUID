@@ -123,17 +123,36 @@ class AbsorptionMeanReversion:
         vwap = vol.session_vwap
         atr = vol.atr_1h
 
+        # ── Filtro de micro-tendencia (evitar comprar cuchillos cayendo) ───────────
+        closes = _get_closes(state, 55)
+        ema_fast = _ema(closes, 20)
+        ema_slow = _ema(closes, 50)
+        rsi = _rsi(closes, 14)
+
+        is_downtrend = (ema_fast is not None and ema_slow is not None and ema_fast < ema_slow and mid < ema_slow)
+        is_uptrend = (ema_fast is not None and ema_slow is not None and ema_fast > ema_slow and mid > ema_slow)
+
+        # Distancia de Stop Loss saludable (mínimo 0.8% del precio para evitar ruido)
+        min_sl_dist = mid * 0.008   # ~ $640 en BTC a $80k
+        sl_dist = max(1.8 * atr, min_sl_dist)
+        sl_dist = min(sl_dist, mid * 0.015)  # tope de 1.5%
+        tp_dist = sl_dist * 1.6              # R:R de 1.6:1
+
         # ── Señal LONG ─────────────────────────────────────────────────────────
-        score_long = 0.0
-        if obi.value > self.OBI_THRESHOLD:
-            score_long += 30
-        if cvd.divergence_1m and cvd.cvd_1m > 0:
-            score_long += 25
-        if mid < (vwap - self.VWAP_SIGMA * atr):
-            score_long += 25
-        if (snap.basis_oi.oi_change_5m_pct is not None
-                and snap.basis_oi.oi_change_5m_pct < self.OI_DROP_PCT):
-            score_long += 20
+        # Si la tendencia es bajista, solo permitir LONG si hay sobreventa extrema real (< 35)
+        if is_downtrend and (rsi is None or rsi > 35 or not cvd.divergence_1m):
+            score_long = 0.0
+        else:
+            score_long = 0.0
+            if obi.value > self.OBI_THRESHOLD:
+                score_long += 30
+            if cvd.divergence_1m and cvd.cvd_1m > 0:
+                score_long += 25
+            if mid < (vwap - self.VWAP_SIGMA * atr):
+                score_long += 25
+            if (snap.basis_oi.oi_change_5m_pct is not None
+                    and snap.basis_oi.oi_change_5m_pct < self.OI_DROP_PCT):
+                score_long += 20
 
         if score_long >= self.SCORE_THRESHOLD:
             confidence = round(score_long / 100.0, 3)
@@ -142,8 +161,8 @@ class AbsorptionMeanReversion:
                 side=SignalSide.BUY,
                 order_type=OrderType.ALO,
                 proposed_price=mid,
-                stop_loss=mid - 1.5 * atr,
-                take_profit=vwap + 0.2 * atr,
+                stop_loss=round(mid - sl_dist, 2),
+                take_profit=round(mid + tp_dist, 2),
                 regime=regime,
                 obi=obi.value,
                 cvd_1m=cvd.cvd_1m,
@@ -151,21 +170,25 @@ class AbsorptionMeanReversion:
                 basis_bps=snap.basis_oi.basis_bps,
                 oi_change_5m=snap.basis_oi.oi_change_5m_pct,
                 estimated_hold_minutes=20.0,
-                expected_r=1.5,
+                expected_r=1.6,
                 confidence=confidence,
             )
 
         # ── Señal SHORT ────────────────────────────────────────────────────────
-        score_short = 0.0
-        if obi.value < -self.OBI_THRESHOLD:
-            score_short += 30
-        if cvd.divergence_1m and cvd.cvd_1m < 0:
-            score_short += 25
-        if mid > (vwap + self.VWAP_SIGMA * atr):
-            score_short += 25
-        if (snap.basis_oi.oi_change_5m_pct is not None
-                and snap.basis_oi.oi_change_5m_pct < self.OI_DROP_PCT):
-            score_short += 20
+        # Si la tendencia es alcista, solo permitir SHORT si hay sobrecompra extrema real (> 65)
+        if is_uptrend and (rsi is None or rsi < 65 or not cvd.divergence_1m):
+            score_short = 0.0
+        else:
+            score_short = 0.0
+            if obi.value < -self.OBI_THRESHOLD:
+                score_short += 30
+            if cvd.divergence_1m and cvd.cvd_1m < 0:
+                score_short += 25
+            if mid > (vwap + self.VWAP_SIGMA * atr):
+                score_short += 25
+            if (snap.basis_oi.oi_change_5m_pct is not None
+                    and snap.basis_oi.oi_change_5m_pct < self.OI_DROP_PCT):
+                score_short += 20
 
         if score_short >= self.SCORE_THRESHOLD:
             confidence = round(score_short / 100.0, 3)
@@ -174,8 +197,8 @@ class AbsorptionMeanReversion:
                 side=SignalSide.SELL,
                 order_type=OrderType.ALO,
                 proposed_price=mid,
-                stop_loss=mid + 1.5 * atr,
-                take_profit=vwap - 0.2 * atr,
+                stop_loss=round(mid + sl_dist, 2),
+                take_profit=round(mid - tp_dist, 2),
                 regime=regime,
                 obi=obi.value,
                 cvd_1m=cvd.cvd_1m,
@@ -183,7 +206,7 @@ class AbsorptionMeanReversion:
                 basis_bps=snap.basis_oi.basis_bps,
                 oi_change_5m=snap.basis_oi.oi_change_5m_pct,
                 estimated_hold_minutes=20.0,
-                expected_r=1.5,
+                expected_r=1.6,
                 confidence=confidence,
             )
 
@@ -253,6 +276,11 @@ class VolatilityBreakout:
         cvd = snap.cvd
         price_oi_regime = basis_oi.price_oi_regime
 
+        min_sl_dist = mid * 0.008
+        sl_dist = max(1.5 * atr, min_sl_dist)
+        sl_dist = min(sl_dist, mid * 0.015)
+        tp_dist = sl_dist * 1.8
+
         if (price_oi_regime == "TREND_LONG"
                 and cvd.cvd_1m > 0
                 and (rsi is None or rsi < 70)):   # no sobrecomprado
@@ -261,7 +289,8 @@ class VolatilityBreakout:
                 side=SignalSide.BUY,
                 order_type=OrderType.IOC,
                 proposed_price=mid,
-                stop_loss=mid - 1.0 * atr,
+                stop_loss=round(mid - sl_dist, 2),
+                take_profit=round(mid + tp_dist, 2),
                 regime=regime,
                 obi=snap.obi.value,
                 cvd_1m=cvd.cvd_1m,
@@ -269,7 +298,7 @@ class VolatilityBreakout:
                 basis_bps=basis_oi.basis_bps,
                 oi_change_5m=basis_oi.oi_change_5m_pct,
                 estimated_hold_minutes=45.0,
-                expected_r=2.0,
+                expected_r=1.8,
                 confidence=min(0.9, 0.6 + breakout_score / 200),
             )
 
@@ -281,7 +310,8 @@ class VolatilityBreakout:
                 side=SignalSide.SELL,
                 order_type=OrderType.IOC,
                 proposed_price=mid,
-                stop_loss=mid + 1.0 * atr,
+                stop_loss=round(mid + sl_dist, 2),
+                take_profit=round(mid - tp_dist, 2),
                 regime=regime,
                 obi=snap.obi.value,
                 cvd_1m=cvd.cvd_1m,
@@ -289,7 +319,7 @@ class VolatilityBreakout:
                 basis_bps=basis_oi.basis_bps,
                 oi_change_5m=basis_oi.oi_change_5m_pct,
                 estimated_hold_minutes=45.0,
-                expected_r=2.0,
+                expected_r=1.8,
                 confidence=min(0.9, 0.6 + breakout_score / 200),
             )
 
@@ -449,7 +479,7 @@ class DecisionEngine:
         ]
         self._on_signal_callbacks: list[Callable[[SignalProposal, bool], None]] = []
         self._last_signal_at: float = 0.0
-        self._min_signal_gap_s: float = 300.0  # máximo 1 señal cada 5 min
+        self._min_signal_gap_s: float = 600.0  # máximo 1 señal cada 10 min
 
     def register_signal_callback(
         self,

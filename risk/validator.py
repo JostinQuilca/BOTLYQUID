@@ -111,6 +111,10 @@ class RiskValidator:
         # 4. Posición única
         self._check_max_position(state)
 
+        # 4b. Cooldown tras pérdida reciente en la misma dirección
+        if not shadow_mode:
+            await self._check_loss_cooldown(signal)
+
         # 5. Dimensionamiento
         equity = state.account.equity or risk_state.equity_open
         approved_size = self._calculate_size(signal, equity, state)
@@ -304,6 +308,44 @@ class RiskValidator:
                 VetoReason.RISK_MAX_POSITION,
                 f"Already have an open position: {state.account.position_size:.6f} BTC",
             )
+
+    async def _check_loss_cooldown(self, signal: SignalProposal) -> None:
+        """
+        Cooldown tras pérdida: si la última operación cerrada fue una pérdida
+        y ocurrió hace menos de 900s (15 min), bloquear reintentos en la misma dirección.
+        """
+        COOLDOWN_SECONDS = 900  # 15 minutos
+        try:
+            async with self._db.execute(
+                "SELECT dir, closed_pnl, ts_ms FROM live_fills WHERE closed_pnl != 0 ORDER BY ts_ms DESC LIMIT 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            if row:
+                dir_str = row[0] if isinstance(row, tuple) else row["dir"]
+                closed_pnl = float(row[1] if isinstance(row, tuple) else row["closed_pnl"])
+                ts_ms = int(row[2] if isinstance(row, tuple) else row["ts_ms"])
+
+                now_ms = time.time() * 1000
+                elapsed_s = (now_ms - ts_ms) / 1000.0
+
+                if closed_pnl < 0 and elapsed_s < COOLDOWN_SECONDS:
+                    was_long = "Long" in str(dir_str)
+                    was_short = "Short" in str(dir_str)
+
+                    if (signal.side == SignalSide.BUY and was_long) or (
+                        signal.side == SignalSide.SELL and was_short
+                    ):
+                        remaining_m = int((COOLDOWN_SECONDS - elapsed_s) / 60) + 1
+                        raise VetoException(
+                            VetoReason.RISK_COOLDOWN,
+                            f"Cooldown activo: pérdida reciente ({closed_pnl:+.4f} USDC hace {int(elapsed_s/60)}m). "
+                            f"Esperando {remaining_m}m antes de otro {signal.side.value}",
+                        )
+        except VetoException:
+            raise
+        except Exception as e:
+            logger.debug("Error comprobando cooldown: %s", e)
 
     def _calculate_size(
         self,
