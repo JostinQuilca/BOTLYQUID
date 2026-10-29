@@ -92,6 +92,8 @@ class AccountState:
     position_entry_price: float = 0.0
     unrealized_pnl: float = 0.0
     margin_used: float = 0.0
+    active_tp_px: float = 0.0
+    active_sl_px: float = 0.0
     timestamp_ms: int = 0
 
     @property

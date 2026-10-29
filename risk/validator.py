@@ -115,6 +115,16 @@ class RiskValidator:
         equity = state.account.equity or risk_state.equity_open
         approved_size = self._calculate_size(signal, equity, state)
 
+        # Calcular take profit aprobado
+        sl_dist = abs(signal.proposed_price - signal.stop_loss)
+        if signal.take_profit is not None and signal.take_profit > 0:
+            approved_tp = signal.take_profit
+        else:
+            if signal.side.value == "BUY":
+                approved_tp = signal.proposed_price + (sl_dist * signal.expected_r)
+            else:
+                approved_tp = signal.proposed_price - (sl_dist * signal.expected_r)
+
         # En shadow mode: aprobar directamente sin chequeos de microestructura
         if shadow_mode:
             effective_leverage = (approved_size * signal.proposed_price) / equity if equity > 0 else 0.0
@@ -128,6 +138,7 @@ class RiskValidator:
                 approved_size=approved_size,
                 approved_price=signal.proposed_price,
                 approved_stop_loss=signal.stop_loss,
+                approved_take_profit=approved_tp,
                 risk_amount_usd=risk_amount_usd,
                 effective_leverage=effective_leverage,
             )
@@ -154,6 +165,7 @@ class RiskValidator:
             approved_size=approved_size,
             approved_price=signal.proposed_price,
             approved_stop_loss=signal.stop_loss,
+            approved_take_profit=approved_tp,
             risk_amount_usd=risk_amount_usd,
             effective_leverage=effective_leverage,
         )

@@ -154,7 +154,14 @@ async def main() -> None:
         market_state=market_state,
         kill_switch_fn=kill_switch_fn,
         pause_fn=pause_fn,
+        db=db,
+        state_machine=state_machine,
     )
+
+    # Vincular dependencias de ingestor y ejecutor con alerter
+    ingestor.set_dependencies(executor=executor, alerter=alerter)
+    if executor:
+        executor.set_alerter(alerter)
 
     # ── 6. Bucle principal ─────────────────────────────────────────────────────
     async def signal_evaluation_loop() -> None:

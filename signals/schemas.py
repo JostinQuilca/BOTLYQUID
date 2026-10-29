@@ -117,6 +117,7 @@ class ApprovedOrder(BaseModel):
     approved_size: float           # En BTC, redondeado a szDecimals
     approved_price: float          # Precio límite final
     approved_stop_loss: float
+    approved_take_profit: float
     risk_amount_usd: float
     effective_leverage: float
     approved_at: datetime = Field(

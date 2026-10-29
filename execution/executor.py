@@ -63,20 +63,29 @@ class HyperliquidExecutor:
         exchange: Any,              # hyperliquid_python_sdk.exchange.Exchange
         state_machine: ExecutorStateMachine,
         symbol: str = "BTC",
+        alerter: Any = None,
     ) -> None:
         self._exchange = exchange
         self._sm = state_machine
         self._symbol = symbol
+        self._alerter = alerter
         self._settings = get_settings()
         self._boot_epoch = get_boot_epoch()   # CORRECCIÓN #2
 
+        self._active_order: ApprovedOrder | None = None
         self._active_entry_cloid: str | None = None
         self._active_sl_oid: int | None = None
+        self._active_tp_oid: int | None = None
+        self._fill_event = asyncio.Event()
         self._last_modify_at: float = 0.0
         self._kill_switch_active = False
 
         # Monitorear archivo STOP_BOT.flag
         asyncio.get_event_loop().create_task(self._monitor_kill_flag())
+
+    def set_alerter(self, alerter: Any) -> None:
+        """Asigna o actualiza el alerter de Telegram."""
+        self._alerter = alerter
 
     # ── Generación de cloid (CORRECCIÓN #2) ───────────────────────────────────
 
@@ -87,13 +96,9 @@ class HyperliquidExecutor:
         CORRECCIÓN #2: Incluye boot_epoch para que el mismo signal_id
         en diferentes ejecuciones del proceso genere cloids distintos.
 
-        Esto previene el rechazo de Hyperliquid de "duplicate cloid"
-        cuando el bot se reinicia y la orden anterior sigue activa.
-
-        Formato: hex de 32 chars (128 bits)
+        Formato: hex de 32 chars (128 bits) con prefijo 0x para el SDK
         """
         seed = f"{signal_id}:{self._boot_epoch}:{self._symbol}"
-        # El SDK de Hyperliquid requiere Cloid con prefijo 0x y exactamente 32 hex chars (16 bytes)
         hex32 = hashlib.sha256(seed.encode()).hexdigest()[:32]
         return Cloid(f"0x{hex32}")
 
@@ -117,16 +122,20 @@ class HyperliquidExecutor:
 
         signal = approved.signal
         cloid = self._make_cloid(signal.signal_id)
+        self._active_order = approved
         self._active_entry_cloid = cloid
+        self._fill_event.clear()
 
         logger.info(
-            "Executing %s %s %.5f BTC @ %.2f (cloid=%s, order_type=%s)",
+            "Executing %s %s %.5f BTC @ %.2f (cloid=%s, order_type=%s, TP=%.2f, SL=%.2f)",
             signal.side.value,
             self._symbol,
             approved.approved_size,
             approved.approved_price,
             cloid,
             signal.order_type.value,
+            approved.approved_take_profit,
+            approved.approved_stop_loss,
         )
 
         await self._sm.transition(ExecutorState.ENTRY_PENDING, f"signal_id={signal.signal_id}")
@@ -144,10 +153,6 @@ class HyperliquidExecutor:
         signal = approved.signal
         is_buy = signal.side == SignalSide.BUY
 
-        # En BTC en Hyperliquid el tick size es 1.0 (número entero).
-        # Para ALO (post-only/maker):
-        # BUY -> floor (para no cruzar hacia arriba con el ask)
-        # SELL -> ceil (para no cruzar hacia abajo con el bid)
         if self._symbol == "BTC":
             order_px = float(math.floor(approved.approved_price) if is_buy else math.ceil(approved.approved_price))
         else:
@@ -160,20 +165,29 @@ class HyperliquidExecutor:
                 approved.approved_size,
                 order_px,
                 {"limit": {"tif": "Alo"}},
-                cloid=cloid,  # ya es un objeto Cloid
+                cloid=cloid,
             )
             logger.info("ALO order result from exchange: %s (px=%.1f)", result, order_px)
             if isinstance(result, dict) and result.get("status") == "err":
                 raise RuntimeError(f"Exchange error: {result.get('response')}")
+
             statuses = result.get("response", {}).get("data", {}).get("statuses", []) if isinstance(result, dict) else []
             for st in statuses:
-                if isinstance(st, dict) and "error" in st:
-                    raise RuntimeError(f"Order rejected by exchange: {st['error']}")
+                if isinstance(st, dict):
+                    if "error" in st:
+                        raise RuntimeError(f"Order rejected by exchange: {st['error']}")
+                    if "filled" in st:
+                        filled_data = st["filled"]
+                        fill_px = float(filled_data.get("avgPx", order_px))
+                        fill_sz = float(filled_data.get("totalSz", approved.approved_size))
+                        oid = int(filled_data.get("oid", 0))
+                        await self.on_fill(cloid, fill_px, fill_sz, oid)
+                        return
 
-            # Esperar fill con timeout
+            # Esperar fill con timeout via asyncio.Event
             try:
                 await asyncio.wait_for(
-                    self._wait_for_fill(cloid),
+                    self._fill_event.wait(),
                     timeout=self.ALO_TIMEOUT_S,
                 )
             except asyncio.TimeoutError:
@@ -204,15 +218,30 @@ class HyperliquidExecutor:
                 approved.approved_size,
                 order_px,
                 {"limit": {"tif": "Ioc"}},
-                cloid=cloid,  # ya es un objeto Cloid
+                cloid=cloid,
             )
             logger.info("IOC order result from exchange: %s (px=%.1f)", result, order_px)
             if isinstance(result, dict) and result.get("status") == "err":
                 raise RuntimeError(f"Exchange error: {result.get('response')}")
+
             statuses = result.get("response", {}).get("data", {}).get("statuses", []) if isinstance(result, dict) else []
+            filled = False
             for st in statuses:
-                if isinstance(st, dict) and "error" in st:
-                    raise RuntimeError(f"Order rejected by exchange: {st['error']}")
+                if isinstance(st, dict):
+                    if "error" in st:
+                        raise RuntimeError(f"Order rejected by exchange: {st['error']}")
+                    if "filled" in st:
+                        filled = True
+                        filled_data = st["filled"]
+                        fill_px = float(filled_data.get("avgPx", order_px))
+                        fill_sz = float(filled_data.get("totalSz", approved.approved_size))
+                        oid = int(filled_data.get("oid", 0))
+                        await self.on_fill(cloid, fill_px, fill_sz, oid)
+                        return
+
+            if not filled:
+                logger.info("IOC order did not fill immediately — returning to FLAT")
+                await self._sm.transition(ExecutorState.FLAT, "IOC cancelled (no fill)")
 
         except Exception as e:
             await self._handle_order_error(e, "IOC entry")
@@ -225,51 +254,67 @@ class HyperliquidExecutor:
         oid: int,
     ) -> None:
         """
-        Llamado cuando llega un fill del canal userEvents.
-        Inicia el proceso de colocación del Stop Loss.
+        Llamado cuando llega un fill (del REST o del canal userEvents).
+        Inicia la colocación automática de Stop Loss y Take Profit.
         """
-        if cloid != self._active_entry_cloid:
+        if self._sm.state in (ExecutorState.OPEN_PROTECTED, ExecutorState.OPEN_UNPROTECTED):
+            logger.debug("on_fill ignored: already in state %s", self._sm.state.value)
             return
 
         logger.info(
-            "Entry FILLED: %.5f @ %.2f (oid=%d)",
+            "Entry FILLED: %.5f @ %.2f (oid=%d, cloid=%s)",
             fill_size,
             fill_price,
             oid,
+            cloid,
         )
 
-        # Transicionar a OPEN_UNPROTECTED (posición real sin SL aún)
+        self._fill_event.set()
+
+        # Transicionar a OPEN_UNPROTECTED (posición real sin SL/TP aún)
         await self._sm.transition(
             ExecutorState.OPEN_UNPROTECTED,
             f"fill @ {fill_price:.2f}",
         )
 
-        # Colocar Stop Loss inmediatamente
-        await self._place_stop_loss_with_retry(fill_price, fill_size)
+        # Colocar Stop Loss y Take Profit automáticamente
+        await self._place_tp_sl_with_retry(fill_price, fill_size)
 
-    async def _place_stop_loss_with_retry(
+    async def _place_tp_sl_with_retry(
         self,
         entry_price: float,
         fill_size: float,
     ) -> None:
         """
-        Intenta colocar el SL hasta SL_MAX_RETRIES veces.
-        Si falla todos los intentos: cierre de emergencia a mercado.
+        Coloca AUTOMÁTICAMENTE el Stop Loss y el Take Profit en Hyperliquid.
+        Lee los precios aprobados de la estrategia sin necesidad de usar el lápiz.
         """
-        # Obtener stop price de la orden aprobada (guardada en estado)
-        # En producción se recupera del DecisionLog o del ApprovedOrder activo
-        stop_price = self._get_active_stop_loss_price(entry_price)
+        if self._active_order is None:
+            is_buy_position = True
+            stop_price = entry_price * 0.985
+            tp_price = entry_price * 1.02
+        else:
+            is_buy_position = (self._active_order.signal.side == SignalSide.BUY)
+            stop_price = self._active_order.approved_stop_loss
+            tp_price = self._active_order.approved_take_profit
+
+        # Redondear según tick size de BTC
         if self._symbol == "BTC":
             stop_price = float(round(stop_price))
+            tp_price = float(round(tp_price))
         else:
             stop_price = round(stop_price, 2)
-        is_buy_position = entry_price > 0   # Simplificado; en prod leer del state_machine
+            tp_price = round(tp_price, 2)
+
+        sl_side = not is_buy_position   # Lado contrario para cerrar
+        tp_side = not is_buy_position
 
         for attempt in range(1, self.SL_MAX_RETRIES + 1):
             try:
-                result = self._exchange.order(
+                # ── 1. Colocar Stop Loss ──────────────────────────────────────────
+                sl_res = self._exchange.order(
                     self._symbol,
-                    not is_buy_position,    # Lado contrario para cerrar
+                    sl_side,
                     fill_size,
                     stop_price,
                     {
@@ -281,38 +326,93 @@ class HyperliquidExecutor:
                     },
                     reduce_only=True,
                 )
+                logger.info("SL order result (attempt %d): %s @ %.1f", attempt, sl_res, stop_price)
 
-                if result and result.get("status") == "ok":
-                    sl_oid = result.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
-                    self._active_sl_oid = sl_oid
+                # ── 2. Colocar Take Profit ────────────────────────────────────────
+                tp_res = self._exchange.order(
+                    self._symbol,
+                    tp_side,
+                    fill_size,
+                    tp_price,
+                    {
+                        "trigger": {
+                            "isMarket": True,
+                            "triggerPx": tp_price,
+                            "tpsl": "tp",
+                        }
+                    },
+                    reduce_only=True,
+                )
+                logger.info("TP order result (attempt %d): %s @ %.1f", attempt, tp_res, tp_price)
+
+                if sl_res and sl_res.get("status") == "ok":
+                    sl_statuses = sl_res.get("response", {}).get("data", {}).get("statuses", [{}])
+                    self._active_sl_oid = sl_statuses[0].get("resting", {}).get("oid") if sl_statuses else None
+
+                    if tp_res and tp_res.get("status") == "ok":
+                        tp_statuses = tp_res.get("response", {}).get("data", {}).get("statuses", [{}])
+                        self._active_tp_oid = tp_statuses[0].get("resting", {}).get("oid") if tp_statuses else None
+
                     await self._sm.transition(
                         ExecutorState.OPEN_PROTECTED,
-                        f"SL placed @ {stop_price:.2f} (oid={sl_oid})",
+                        f"TP/SL placed: TP={tp_price:.1f}, SL={stop_price:.1f}",
                     )
-                    logger.info("Stop Loss confirmed: oid=%s @ %.2f", sl_oid, stop_price)
+                    logger.info(
+                        "Position PROTECTED: TP=%.1f (oid=%s), SL=%.1f (oid=%s)",
+                        tp_price, self._active_tp_oid,
+                        stop_price, self._active_sl_oid,
+                    )
+
+                    # Alerta a Telegram
+                    if self._alerter:
+                        side_lbl = "LONG 🟢" if is_buy_position else "SHORT 🔴"
+                        notional = fill_size * entry_price
+                        await self._alerter.send(
+                            f"✅ *POSICIÓN ABIERTA Y PROTEGIDA*\n"
+                            f"Lado: {side_lbl}\n"
+                            f"Tamaño: `{fill_size:.5f} BTC` (~${notional:.2f} USDC)\n"
+                            f"Entrada: `${entry_price:,.2f}`\n"
+                            f"🎯 Take Profit: `${tp_price:,.2f}`\n"
+                            f"🛑 Stop Loss: `${stop_price:,.2f}`",
+                            alert_type="FILL",
+                        )
                     return
 
             except Exception as e:
-                logger.error("SL placement attempt %d/%d failed: %s", attempt, self.SL_MAX_RETRIES, e)
+                logger.error("TP/SL placement attempt %d/%d failed: %s", attempt, self.SL_MAX_RETRIES, e)
 
             if attempt < self.SL_MAX_RETRIES:
                 await asyncio.sleep(1.0)
 
         # EMERGENCIA: SL falló todos los intentos
         logger.critical(
-            "EMERGENCY: Failed to place SL after %d attempts. "
-            "Closing position at market!",
+            "EMERGENCY: Failed to place SL/TP after %d attempts. Closing position at market!",
             self.SL_MAX_RETRIES,
         )
-        await self._emergency_close(fill_size, "SL placement failed")
+        await self._emergency_close(fill_size, "TP/SL placement failed")
 
-    def _get_active_stop_loss_price(self, entry_price: float) -> float:
+    async def on_position_closed(self, reason: str = "TP/SL hit") -> None:
         """
-        Retorna el precio de stop loss de la señal activa.
-        En producción, esto viene del ApprovedOrder almacenado en el executor.
+        Llamado cuando la posición se cierra en el exchange (por TP, SL o cierre manual).
+        Cancela cualquier orden residual y regresa la máquina de estados a FLAT.
         """
-        # Placeholder: 1.5% del precio de entrada (sobreescrito en producción)
-        return entry_price * 0.985
+        logger.info("Position closed (%s). Cleaning up residual orders...", reason)
+        try:
+            self._exchange.cancel_all(self._symbol)
+            logger.info("Residual orders cancelled for %s", self._symbol)
+        except Exception:
+            logger.exception("Failed to cancel residual orders on position close")
+
+        self._active_order = None
+        self._active_entry_cloid = None
+        self._active_sl_oid = None
+        self._active_tp_oid = None
+
+        if self._sm.state not in (ExecutorState.FLAT, ExecutorState.HALTED):
+            try:
+                await self._sm.transition(ExecutorState.FLAT, reason)
+            except InvalidTransitionError:
+                pass
 
     # ── Cierre de emergencia ───────────────────────────────────────────────────
 

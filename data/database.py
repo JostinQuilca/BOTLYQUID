@@ -135,10 +135,26 @@ CREATE TABLE IF NOT EXISTS daily_risk (
     updated_at      REAL NOT NULL DEFAULT (unixepoch('now', 'subsec'))
 );
 
+CREATE TABLE IF NOT EXISTS live_fills (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tid             INTEGER NOT NULL UNIQUE,
+    oid             INTEGER,
+    symbol          TEXT NOT NULL,
+    dir             TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    px              REAL NOT NULL,
+    sz              REAL NOT NULL,
+    closed_pnl      REAL NOT NULL DEFAULT 0.0,
+    fee             REAL NOT NULL DEFAULT 0.0,
+    ts_ms           INTEGER NOT NULL,
+    created_at      REAL NOT NULL DEFAULT (unixepoch('now', 'subsec'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_candles_ts ON candles_1m(ts_ms DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_cloid ON orders(cloid);
 CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_shadow_pnl_unique ON shadow_pnl(decision_id, horizon_label);
+CREATE INDEX IF NOT EXISTS idx_live_fills_ts ON live_fills(ts_ms DESC);
 """
 
 
@@ -277,6 +293,7 @@ class DatabaseWorker:
                     f"ON CONFLICT(date_utc) DO UPDATE SET "
                     f"equity_open = CASE WHEN daily_risk.equity_open <= 0 THEN excluded.equity_open ELSE daily_risk.equity_open END, "
                     f"equity_peak = MAX(daily_risk.equity_peak, excluded.equity_peak), "
+                    f"unrealized_pnl = excluded.unrealized_pnl, "
                     f"updated_at = unixepoch('now', 'subsec')"
                 )
             else:

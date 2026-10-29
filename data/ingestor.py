@@ -53,15 +53,23 @@ class HyperliquidIngestor:
         state: MarketState,
         db_worker: DatabaseWorker,
         symbol: str = "BTC",
+        executor: Any = None,
+        alerter: Any = None,
     ) -> None:
         self._state = state
         self._db_worker = db_worker
         self._symbol = symbol
+        self._executor = executor
+        self._alerter = alerter
         self._settings = get_settings()
         self._running = False
         self._reconnect_attempts = 0
         self._trades_buffer: list[dict[str, Any]] = []
         self._last_parquet_dump = time.monotonic()
+
+    def set_dependencies(self, executor: Any, alerter: Any) -> None:
+        self._executor = executor
+        self._alerter = alerter
 
     async def run(self, db_conn: Any) -> None:
         """Bucle principal de reconexión con backoff exponencial + jitter."""
@@ -168,7 +176,7 @@ class HyperliquidIngestor:
         elif channel == "candle":
             self._handle_candle(data)
         elif channel == "userEvents":
-            self._handle_user_events(data)
+            await self._handle_user_events(data)
 
     # ── Handlers de mensajes ───────────────────────────────────────────────────
 
@@ -248,20 +256,85 @@ class HyperliquidIngestor:
             event_type="upsert",
         ))
 
-    def _handle_user_events(self, data: Any) -> None:
+    async def _handle_user_events(self, data: Any) -> None:
         """
         Procesa fills, cancelaciones y liquidaciones de la cuenta.
-        Los fills se delegan al ejecutor via evento (ver execution/).
+        Guarda en live_fills, notifica al ejecutor y alerta a Telegram.
         """
+        from datetime import date
+
         if isinstance(data, dict) and "fills" in data:
             for fill in data["fills"]:
+                tid = int(fill.get("tid", int(time.time() * 1000)))
+                oid = int(fill.get("oid", 0))
+                px = float(fill.get("px", 0.0))
+                sz = float(fill.get("sz", 0.0))
+                side = str(fill.get("side", ""))
+                dir_str = str(fill.get("dir", ""))
+                closed_pnl = float(fill.get("closedPnl", 0.0))
+                fee = float(fill.get("fee", 0.0))
+                ts_ms = int(fill.get("time", time.time() * 1000))
+
                 logger.info(
-                    "FILL: %s %s @ %s (oid=%s)",
-                    fill.get("side"),
-                    fill.get("sz"),
-                    fill.get("px"),
-                    fill.get("oid"),
+                    "FILL: %s %s @ %s (dir=%s, oid=%s, closedPnl=%s)",
+                    side, sz, px, dir_str, oid, closed_pnl,
                 )
+
+                # Guardar en live_fills
+                self._db_worker.enqueue(
+                    DBEvent(
+                        table="live_fills",
+                        event_type="insert",
+                        data={
+                            "tid": tid,
+                            "oid": oid,
+                            "symbol": self._symbol,
+                            "dir": dir_str,
+                            "side": side,
+                            "px": px,
+                            "sz": sz,
+                            "closed_pnl": closed_pnl,
+                            "fee": fee,
+                            "ts_ms": ts_ms,
+                        },
+                    )
+                )
+
+                # Si es apertura, notificar a executor
+                if "Open" in dir_str and self._executor:
+                    active_cloid = getattr(self._executor, "_active_entry_cloid", None)
+                    await self._executor.on_fill(active_cloid, px, sz, oid)
+
+                # Si es cierre o tiene PnL cerrado
+                if "Close" in dir_str or abs(closed_pnl) > 0:
+                    net_pnl = closed_pnl - fee
+                    today = date.today().isoformat()
+                    if hasattr(self, "_db_conn") and self._db_conn:
+                        try:
+                            await self._db_conn.execute(
+                                "UPDATE daily_risk SET realized_pnl = realized_pnl + ?, updated_at = unixepoch('now', 'subsec') WHERE date_utc = ?",
+                                (net_pnl, today),
+                            )
+                            await self._db_conn.commit()
+                        except Exception:
+                            logger.exception("Failed to update daily_risk realized_pnl")
+
+                    if self._alerter:
+                        emoji = "💰 GANANCIA" if net_pnl >= 0 else "📉 PÉRDIDA"
+                        await self._alerter.send(
+                            f"{emoji} — *OPERACIÓN CERRADA*\n"
+                            f"Acción: `{dir_str}`\n"
+                            f"Precio salida: `${px:,.2f}`\n"
+                            f"Tamaño: `{sz:.5f} BTC`\n"
+                            f"PnL Bruto: `{closed_pnl:+.4f} USDC`\n"
+                            f"Comisión: `-{fee:.4f} USDC`\n"
+                            f"*PnL Neto: {net_pnl:+.4f} USDC*\n"
+                            f"Capital actual: `${self._state.account.equity + net_pnl:,.2f} USDC`",
+                            alert_type="FILL",
+                        )
+
+                    if self._executor:
+                        await self._executor.on_position_closed(f"Fill {dir_str}")
 
     # ── Reconciliador REST ─────────────────────────────────────────────────────
 
@@ -337,6 +410,34 @@ class HyperliquidIngestor:
         self._state.account.equity = equity
         self._state.account.available_margin = withdrawable
 
+        # ── Posición ───────────────────────────────────────────────────────────
+        positions = state_data.get("assetPositions", [])
+        real_pos = 0.0
+        entry_px = 0.0
+        unreal_pnl = 0.0
+        margin_used = 0.0
+        for pos in positions:
+            p = pos.get("position", {})
+            if p.get("coin") == self._symbol:
+                real_pos = float(p.get("szi", 0))
+                entry_px = float(p.get("entryPx") or 0)
+                unreal_pnl = float(p.get("unrealizedPnl") or 0.0)
+                margin_used = float(p.get("marginUsed") or 0.0)
+                break
+
+        self._state.account.unrealized_pnl = unreal_pnl
+        self._state.account.margin_used = margin_used
+
+        mem_pos = self._state.account.position_size
+        if abs(real_pos - mem_pos) > 1e-6:
+            logger.warning(
+                "RECONCILE MISMATCH: memory=%.6f, exchange=%.6f",
+                mem_pos,
+                real_pos,
+            )
+            self._state.account.position_size = real_pos
+            self._state.account.position_entry_price = entry_px
+
         # Inicializar / actualizar daily_risk en BD para el Dashboard
         if equity > 0:
             today = date.today().isoformat()
@@ -349,38 +450,90 @@ class HyperliquidIngestor:
                         "equity_open": equity,
                         "equity_peak": equity,
                         "realized_pnl": 0.0,
-                        "unrealized_pnl": 0.0,
+                        "unrealized_pnl": unreal_pnl,
                         "paused_until": None,
                         "kill_switch": 0,
                     },
                 )
             )
 
-        # ── Posición ───────────────────────────────────────────────────────────
-        positions = state_data.get("assetPositions", [])
-        real_pos = 0.0
-        entry_px = 0.0
-        for pos in positions:
-            p = pos.get("position", {})
-            if p.get("coin") == self._symbol:
-                real_pos = float(p.get("szi", 0))
-                entry_px = float(p.get("entryPx") or 0)
-                break
+        # ── 3. Órdenes abiertas (TP / SL en exchange) ──────────────────────────
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                orders_resp = await client.post(url, json={
+                    "type": "frontendOpenOrders",
+                    "user": main_address,
+                })
+                open_orders = orders_resp.json() if orders_resp.status_code == 200 else []
+        except Exception:
+            open_orders = []
 
-        mem_pos = self._state.account.position_size
-        if abs(real_pos - mem_pos) > 1e-6:
-            logger.warning(
-                "RECONCILE MISMATCH: memory=%.6f, exchange=%.6f",
-                mem_pos,
-                real_pos,
-            )
-            self._state.account.position_size = real_pos
-            self._state.account.position_entry_price = entry_px
+        active_tp = 0.0
+        active_sl = 0.0
+        if isinstance(open_orders, list):
+            for o in open_orders:
+                if o.get("coin") == self._symbol:
+                    order_type = str(o.get("orderType", ""))
+                    tpsl_type = str(o.get("tpsl", ""))
+                    trig_px = float(o.get("triggerPx") or 0.0)
+                    if not trig_px and "triggerPx" in o:
+                        trig_px = float(o["triggerPx"])
+                    if tpsl_type == "tp" or "take" in order_type.lower():
+                        active_tp = trig_px
+                    elif tpsl_type == "sl" or "stop" in order_type.lower():
+                        active_sl = trig_px
+
+        self._state.account.active_tp_px = active_tp
+        self._state.account.active_sl_px = active_sl
+
+        # Si no hay posición en exchange pero el ejecutor sigue activo, liberar
+        if abs(real_pos) < 1e-6:
+            self._state.account.active_tp_px = 0.0
+            self._state.account.active_sl_px = 0.0
+            if self._executor and hasattr(self._executor, "_sm"):
+                from execution.state_machine import ExecutorState
+                if self._executor._sm.state in (ExecutorState.OPEN_PROTECTED, ExecutorState.OPEN_UNPROTECTED):
+                    await self._executor.on_position_closed("Reconcile: position is 0 on exchange")
+
+        # ── 4. Sincronizar fills recientes desde REST (resiliencia) ───────────
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                fills_resp = await client.post(url, json={
+                    "type": "userFills",
+                    "user": main_address,
+                })
+                recent_user_fills = fills_resp.json() if fills_resp.status_code == 200 else []
+            if recent_user_fills and hasattr(self, "_db_conn") and self._db_conn:
+                for f in recent_user_fills[:20]:
+                    if f.get("coin") == self._symbol:
+                        tid = int(f.get("tid", 0))
+                        oid = int(f.get("oid", 0))
+                        px = float(f.get("px", 0.0))
+                        sz = float(f.get("sz", 0.0))
+                        side = str(f.get("side", ""))
+                        dir_str = str(f.get("dir", ""))
+                        closed_pnl = float(f.get("closedPnl", 0.0))
+                        fee = float(f.get("fee", 0.0))
+                        ts_ms = int(f.get("time", 0))
+                        await self._db_conn.execute(
+                            """
+                            INSERT OR IGNORE INTO live_fills
+                            (tid, oid, symbol, dir, side, px, sz, closed_pnl, fee, ts_ms)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (tid, oid, self._symbol, dir_str, side, px, sz, closed_pnl, fee, ts_ms),
+                        )
+                await self._db_conn.commit()
+        except Exception:
+            logger.exception("Failed to sync recent fills into live_fills")
 
         logger.debug(
-            "Reconciled: equity=%.4f, pos=%.6f, tick_age=%.0fms",
+            "Reconciled: equity=%.4f, pos=%.6f, unreal_pnl=%.4f, tp=%.1f, sl=%.1f, tick_age=%.0fms",
             equity,
             real_pos,
+            unreal_pnl,
+            active_tp,
+            active_sl,
             self._state.last_tick_age_ms,
         )
 
