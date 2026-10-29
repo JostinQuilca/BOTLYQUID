@@ -529,7 +529,7 @@ class HyperliquidIngestor:
                     alert_type="CRITICAL",
                 )
             try:
-                await self._executor.ensure_protected(entry_px, abs(real_pos))
+                await self._executor.ensure_protected(entry_px, real_pos)
             except Exception:
                 logger.exception("Fallo al recolocar SL/TP desde el reconciliador")
 

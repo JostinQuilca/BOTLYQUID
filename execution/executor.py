@@ -319,78 +319,81 @@ class HyperliquidExecutor:
 
     # ── Auto-sanación (llamado por el reconciliador) ──────────────────────────
 
-    async def ensure_protected(self, entry_price: float, size: float) -> None:
+    async def ensure_protected(self, entry_price: float, signed_size: float) -> None:
         """
-        FIX #B: verifica/fuerza que la posición real actual tenga SL y TP en
-        el exchange. Pensado para ser llamado por el reconciliador REST cuando
-        detecta una posición abierta sin protección completa — por ejemplo si
-        se perdió el evento de fill del WebSocket, o si el proceso se reinició
-        con una posición ya abierta en el exchange.
-
-        Antes, el reconciliador detectaba `active_tp == 0` / `active_sl == 0`
-        con una posición real abierta, lo dejaba en los logs/dashboard, y no
-        hacía NADA para corregirlo: la posición podía quedar desprotegida
-        indefinidamente.
+        Fuerza la colocación de SL y TP cuando el reconciliador detecta
+        que faltan en el exchange, incluso si el estado decía OPEN_PROTECTED.
         """
         if self._kill_switch_active:
             logger.info("ensure_protected: kill switch activo, no se protege")
             return
 
-        if self._sm.state == ExecutorState.OPEN_PROTECTED:
-            return  # ya protegida, nada que hacer
+        size = abs(signed_size)
+        is_long_fallback = signed_size > 0
 
         logger.critical(
             "RECONCILE: posición real de %.6f %s SIN protección completa detectada "
             "(entry=%.2f). Forzando colocación de SL/TP.",
-            size, self._symbol, entry_price,
+            signed_size, self._symbol, entry_price,
         )
 
-        # Llevar el estado a uno desde el que VALID_TRANSITIONS permita llegar
-        # a OPEN_PROTECTED (ver execution/state_machine.py). Si el proceso se
-        # reinició, lo normal es partir de FLAT sin saber nada de esta posición.
         try:
-            if self._sm.state == ExecutorState.FLAT:
+            # Si creía estar protegido pero el exchange no tiene las órdenes, regresar a OPEN_UNPROTECTED
+            if self._sm.state == ExecutorState.OPEN_PROTECTED:
+                await self._sm.transition(
+                    ExecutorState.OPEN_UNPROTECTED, "reconcile: missing TP/SL on exchange"
+                )
+            elif self._sm.state == ExecutorState.FLAT:
                 await self._sm.transition(
                     ExecutorState.ENTRY_PENDING, "reconcile: unprotected position found"
                 )
-            if self._sm.state == ExecutorState.ENTRY_PENDING:
+                await self._sm.transition(
+                    ExecutorState.OPEN_UNPROTECTED, "reconcile: unprotected position found"
+                )
+            elif self._sm.state == ExecutorState.ENTRY_PENDING:
                 await self._sm.transition(
                     ExecutorState.OPEN_UNPROTECTED, "reconcile: unprotected position found"
                 )
         except InvalidTransitionError as e:
             logger.critical(
-                "No se pudo preparar la máquina de estados para proteger la "
-                "posición (%s). Se intenta igual colocar SL/TP.", e,
+                "No se pudo preparar la máquina de estados (%s). Se intenta igual colocar SL/TP.", e
             )
 
         async with self._protect_lock:
-            await self._place_tp_sl_with_retry(entry_price, size)
+            # Limpiar órdenes huérfanas previas antes de recolocar el par TP/SL limpio
+            try:
+                self._exchange.cancel_all(self._symbol)
+            except Exception:
+                pass
+            await self._place_tp_sl_with_retry(entry_price, size, is_long_fallback=is_long_fallback)
 
     async def _place_tp_sl_with_retry(
         self,
         entry_price: float,
         fill_size: float,
+        is_long_fallback: bool = True,
     ) -> None:
         """
-        Coloca AUTOMÁTICAMENTE el Stop Loss y el Take Profit en Hyperliquid.
-        Lee los precios aprobados de la estrategia sin necesidad de usar el lápiz.
+        Coloca AUTOMÁTICAMENTE el Stop Loss y el Take Profit en Hyperliquid
+        y verifica que no exista rechazo dentro de 'statuses'.
         """
-        # FIX: idempotencia — si entre que se decidió llamar a esta función y que
-        # se ejecuta ya quedó protegida (por una llamada concurrente), no duplicar
-        # las órdenes de SL/TP en el exchange.
         if self._sm.state == ExecutorState.OPEN_PROTECTED:
             logger.debug("_place_tp_sl_with_retry: ya protegida, nada que hacer")
             return
+
         if self._active_order is None:
-            is_buy_position = True
-            stop_price = entry_price * 0.985
-            tp_price = entry_price * 1.02
+            is_buy_position = is_long_fallback
+            if is_buy_position:
+                stop_price = entry_price * 0.985
+                tp_price = entry_price * 1.02
+            else:
+                stop_price = entry_price * 1.015
+                tp_price = entry_price * 0.98
         else:
             is_buy_position = (self._active_order.signal.side == SignalSide.BUY)
             stop_price = self._active_order.approved_stop_loss
             tp_price = self._active_order.approved_take_profit
 
-        # Redondear según tick size de BTC
         if self._symbol == "BTC":
             stop_price = float(round(stop_price))
             tp_price = float(round(tp_price))
@@ -398,77 +401,77 @@ class HyperliquidExecutor:
             stop_price = round(stop_price, 2)
             tp_price = round(tp_price, 2)
 
-        sl_side = not is_buy_position   # Lado contrario para cerrar
+        sl_side = not is_buy_position
         tp_side = not is_buy_position
 
         for attempt in range(1, self.SL_MAX_RETRIES + 1):
             try:
-                # ── 1. Colocar Stop Loss ──────────────────────────────────────────
+                # 1. Colocar Stop Loss
                 sl_res = self._exchange.order(
                     self._symbol,
                     sl_side,
                     fill_size,
                     stop_price,
-                    {
-                        "trigger": {
-                            "isMarket": True,
-                            "triggerPx": stop_price,
-                            "tpsl": "sl",
-                        }
-                    },
+                    {"trigger": {"isMarket": True, "triggerPx": stop_price, "tpsl": "sl"}},
                     reduce_only=True,
                 )
                 logger.info("SL order result (attempt %d): %s @ %.1f", attempt, sl_res, stop_price)
 
-                # ── 2. Colocar Take Profit ────────────────────────────────────────
+                # 2. Colocar Take Profit
                 tp_res = self._exchange.order(
                     self._symbol,
                     tp_side,
                     fill_size,
                     tp_price,
-                    {
-                        "trigger": {
-                            "isMarket": True,
-                            "triggerPx": tp_price,
-                            "tpsl": "tp",
-                        }
-                    },
+                    {"trigger": {"isMarket": True, "triggerPx": tp_price, "tpsl": "tp"}},
                     reduce_only=True,
                 )
                 logger.info("TP order result (attempt %d): %s @ %.1f", attempt, tp_res, tp_price)
 
-                if sl_res and sl_res.get("status") == "ok":
-                    sl_statuses = sl_res.get("response", {}).get("data", {}).get("statuses", [{}])
-                    self._active_sl_oid = sl_statuses[0].get("resting", {}).get("oid") if sl_statuses else None
+                # Verificar que AMBAS respuestas sean 'ok' y NO contengan 'error' en statuses
+                if not (isinstance(sl_res, dict) and sl_res.get("status") == "ok"):
+                    raise RuntimeError(f"Exchange SL error: {sl_res}")
+                if not (isinstance(tp_res, dict) and tp_res.get("status") == "ok"):
+                    raise RuntimeError(f"Exchange TP error: {tp_res}")
 
-                    if tp_res and tp_res.get("status") == "ok":
-                        tp_statuses = tp_res.get("response", {}).get("data", {}).get("statuses", [{}])
-                        self._active_tp_oid = tp_statuses[0].get("resting", {}).get("oid") if tp_statuses else None
+                sl_data = sl_res.get("response", {}) if isinstance(sl_res.get("response"), dict) else {}
+                tp_data = tp_res.get("response", {}) if isinstance(tp_res.get("response"), dict) else {}
 
-                    await self._sm.transition(
-                        ExecutorState.OPEN_PROTECTED,
-                        f"TP/SL placed: TP={tp_price:.1f}, SL={stop_price:.1f}",
+                sl_statuses = sl_data.get("data", {}).get("statuses", [{}])
+                tp_statuses = tp_data.get("data", {}).get("statuses", [{}])
+
+                sl_err = sl_statuses[0].get("error") if sl_statuses and isinstance(sl_statuses[0], dict) else "No status"
+                tp_err = tp_statuses[0].get("error") if tp_statuses and isinstance(tp_statuses[0], dict) else "No status"
+
+                if sl_err or tp_err:
+                    raise RuntimeError(f"Rechazo en trigger orders -> SL_err={sl_err}, TP_err={tp_err}")
+
+                self._active_sl_oid = sl_statuses[0].get("resting", {}).get("oid") if sl_statuses else None
+                self._active_tp_oid = tp_statuses[0].get("resting", {}).get("oid") if tp_statuses else None
+
+                await self._sm.transition(
+                    ExecutorState.OPEN_PROTECTED,
+                    f"TP/SL placed: TP={tp_price:.1f}, SL={stop_price:.1f}",
+                )
+                logger.info(
+                    "Position PROTECTED: TP=%.1f (oid=%s), SL=%.1f (oid=%s)",
+                    tp_price, self._active_tp_oid,
+                    stop_price, self._active_sl_oid,
+                )
+
+                if self._alerter:
+                    side_lbl = "LONG 🟢" if is_buy_position else "SHORT 🔴"
+                    notional = fill_size * entry_price
+                    await self._alerter.send(
+                        f"✅ *POSICIÓN ABIERTA Y PROTEGIDA*\n"
+                        f"Lado: {side_lbl}\n"
+                        f"Tamaño: `{fill_size:.5f} BTC` (~${notional:.2f} USDC)\n"
+                        f"Entrada: `${entry_price:,.2f}`\n"
+                        f"🎯 Take Profit: `${tp_price:,.2f}`\n"
+                        f"🛑 Stop Loss: `${stop_price:,.2f}`",
+                        alert_type="FILL",
                     )
-                    logger.info(
-                        "Position PROTECTED: TP=%.1f (oid=%s), SL=%.1f (oid=%s)",
-                        tp_price, self._active_tp_oid,
-                        stop_price, self._active_sl_oid,
-                    )
-
-                    # Alerta a Telegram
-                    if self._alerter:
-                        side_lbl = "LONG 🟢" if is_buy_position else "SHORT 🔴"
-                        notional = fill_size * entry_price
-                        await self._alerter.send(
-                            f"✅ *POSICIÓN ABIERTA Y PROTEGIDA*\n"
-                            f"Lado: {side_lbl}\n"
-                            f"Tamaño: `{fill_size:.5f} BTC` (~${notional:.2f} USDC)\n"
-                            f"Entrada: `${entry_price:,.2f}`\n"
-                            f"🎯 Take Profit: `${tp_price:,.2f}`\n"
-                            f"🛑 Stop Loss: `${stop_price:,.2f}`",
-                            alert_type="FILL",
-                        )
-                    return
+                return
 
             except Exception as e:
                 logger.error("TP/SL placement attempt %d/%d failed: %s", attempt, self.SL_MAX_RETRIES, e)
