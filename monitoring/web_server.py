@@ -210,6 +210,8 @@ def render_dashboard(state: MarketState, executor: Any = None) -> str:
 def start_web_server(port: int, state: MarketState, executor: Any = None) -> ThreadingHTTPServer:
     """Inicia el servidor HTTP estándar en un hilo demonio."""
     class DashboardHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def do_GET(self) -> None:
             try:
                 html = render_dashboard(state, executor)
@@ -217,9 +219,9 @@ def start_web_server(port: int, state: MarketState, executor: Any = None) -> Thr
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
+                self.wfile.flush()
             except Exception:
                 pass
 
