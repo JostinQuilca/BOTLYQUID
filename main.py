@@ -445,16 +445,13 @@ async def main() -> None:
                     logger.warning("Telegram no disponible: %s — bot continua sin alertas", e)
                     return
 
-        async def dashboard_loop() -> None:
-            """Inicia el dashboard web HTTP nativo en el puerto 8080 (Fly.io)."""
-            from monitoring.web_server import start_web_server
-            port = int(os.environ.get("PORT", "8080"))
-            try:
-                server = await start_web_server(port, market_state, executor)
-                async with server:
-                    await server.serve_forever()
-            except Exception as e:
-                logger.warning("No se pudo iniciar el dashboard web en puerto %d: %s", port, e)
+        # Iniciar dashboard web HTTP nativo en el puerto 8080 (Fly.io)
+        from monitoring.web_server import start_web_server
+        port = int(os.environ.get("PORT", "8080"))
+        try:
+            start_web_server(port, market_state, executor)
+        except Exception as e:
+            logger.warning("No se pudo iniciar el dashboard web en puerto %d: %s", port, e)
 
         tasks = [
             asyncio.create_task(db_worker.run(), name="db_worker"),
@@ -464,7 +461,6 @@ async def main() -> None:
             asyncio.create_task(heartbeat_loop(), name="heartbeat"),
             asyncio.create_task(shadow_pnl_resolver_loop(), name="shadow_pnl_resolver"),
             asyncio.create_task(telegram_loop(), name="telegram"),
-            asyncio.create_task(dashboard_loop(), name="dashboard"),
         ]
 
         await asyncio.gather(*tasks)

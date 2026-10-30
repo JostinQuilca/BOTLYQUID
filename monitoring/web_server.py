@@ -1,15 +1,15 @@
 """
 monitoring/web_server.py
 ========================
-Servidor web asíncrono ultraligero integrado (sin dependencias externas).
-Escucha en 0.0.0.0:8080 (o PORT de entorno) para servir el Dashboard de Fly.io.
+Servidor web HTTP multihilo ultraligero (estándar Python).
+Sirve el Dashboard en tiempo real en el puerto 8080 para Fly.io.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from data.state import MarketState
@@ -36,8 +36,8 @@ def render_dashboard(state: MarketState, executor: Any = None) -> str:
     pnl_sign = "+" if pos_pnl >= 0 else ""
     
     # Estado de protección TP/SL
-    tp_status = "Activo" if (executor and executor.active_tp_oid) else "Sin TP"
-    sl_status = "Activo" if (executor and executor.active_sl_oid) else "Sin SL"
+    tp_status = "Activo" if (executor and getattr(executor, "_active_tp_oid", None)) else "Pendiente"
+    sl_status = "Activo" if (executor and getattr(executor, "_active_sl_oid", None)) else "Pendiente"
     
     return f"""<!DOCTYPE html>
 <html lang="es">
@@ -154,7 +154,7 @@ def render_dashboard(state: MarketState, executor: Any = None) -> str:
         <div class="pos-header">
             <span>📊 Posición Actual en Hyperliquid</span>
             <span style="color: {'#00ff88' if has_pos else '#8899bb'}; font-weight: bold;">
-                {'🟢 ABIERTA' if has_pos else '⚪ FLAT (Sin posición)'}
+                {'🟢 ABIERTA (LONG)' if (has_pos and pos_sz > 0) else ('🔴 ABIERTA (SHORT)' if (has_pos and pos_sz < 0) else '⚪ FLAT (Sin posición)')}
             </span>
         </div>
         <div class="pos-grid">
@@ -180,7 +180,7 @@ def render_dashboard(state: MarketState, executor: Any = None) -> str:
     <!-- Estrategias Activas -->
     <div class="grid">
         <div class="card">
-            <div class="card-label">Estrategias Activas</div>
+            <div class="card-label">Estrategias Activas v3</div>
             <div style="font-size: 14px; line-height: 1.8; color: #a5b4d8;">
                 ✓ TrendMomentum (Trend + RSI + CVD)<br>
                 ✓ AbsorptionMeanReversion (VWAP + OBI)<br>
@@ -207,36 +207,28 @@ def render_dashboard(state: MarketState, executor: Any = None) -> str:
 """
 
 
-async def start_web_server(port: int, state: MarketState, executor: Any = None) -> asyncio.Server:
-    """Inicia el servidor HTTP asíncrono en el puerto indicado."""
-    async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            # Leer petición HTTP básica
-            while True:
-                line = await reader.readline()
-                if not line or line in (b"\r\n", b"\n"):
-                    break
-
-            html = render_dashboard(state, executor)
-            body = html.encode("utf-8")
-            response = (
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: text/html; charset=utf-8\r\n"
-                b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n"
-                b"Connection: close\r\n"
-                b"\r\n" + body
-            )
-            writer.write(response)
-            await writer.drain()
-        except Exception:
-            pass
-        finally:
+def start_web_server(port: int, state: MarketState, executor: Any = None) -> ThreadingHTTPServer:
+    """Inicia el servidor HTTP estándar en un hilo demonio."""
+    class DashboardHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
             try:
-                writer.close()
-                await writer.wait_closed()
+                html = render_dashboard(state, executor)
+                body = html.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
             except Exception:
                 pass
 
-    server = await asyncio.start_server(handle_client, "0.0.0.0", port)
-    logger.info("Web dashboard HTTP server listening on 0.0.0.0:%d", port)
+        def log_message(self, format: str, *args: Any) -> None:
+            # Silenciar logs para no saturar consola
+            pass
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True, name="web_dashboard")
+    thread.start()
+    logger.info("Web dashboard HTTP server listening on 0.0.0.0:%d (thread daemon)", port)
     return server
