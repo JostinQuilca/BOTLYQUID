@@ -29,15 +29,17 @@ def render_dashboard(state: MarketState, executor: Any = None) -> str:
     # Posición
     has_pos = state.account.has_position if state.account else False
     pos_sz = state.account.position_size if state.account else 0.0
-    pos_entry = state.account.entry_price if state.account else 0.0
+    pos_entry = state.account.position_entry_price if state.account else 0.0
     pos_pnl = state.account.unrealized_pnl if state.account else 0.0
     
     pnl_color = "#00ff88" if pos_pnl >= 0 else "#ff4466"
     pnl_sign = "+" if pos_pnl >= 0 else ""
     
     # Estado de protección TP/SL
-    tp_status = "Activo" if (executor and getattr(executor, "_active_tp_oid", None)) else "Pendiente"
-    sl_status = "Activo" if (executor and getattr(executor, "_active_sl_oid", None)) else "Pendiente"
+    tp_oid = getattr(executor, "_active_tp_oid", None) if executor else None
+    sl_oid = getattr(executor, "_active_sl_oid", None) if executor else None
+    tp_status = "Activo en Hyperliquid" if tp_oid else ("Configurado" if (state.account and state.account.active_tp_px > 0) else "Esperando señal")
+    sl_status = "Activo en Hyperliquid" if sl_oid else ("Configurado" if (state.account and state.account.active_sl_px > 0) else "Esperando señal")
     
     return f"""<!DOCTYPE html>
 <html lang="es">
@@ -214,11 +216,29 @@ def start_web_server(port: int, state: MarketState, executor: Any = None) -> Any
     class DualStackServer(ThreadingHTTPServer):
         address_family = socket.AF_INET6
 
+        def server_bind(self) -> None:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, OSError) as e:
+                logger.debug("Could not set IPV6_V6ONLY: %s", e)
+            super().server_bind()
+
     class DashboardHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def do_GET(self) -> None:
             try:
+                if self.path == "/health":
+                    body = b"OK"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                    return
+
                 html = render_dashboard(state, executor)
                 body = html.encode("utf-8")
                 self.send_response(200)
@@ -228,8 +248,19 @@ def start_web_server(port: int, state: MarketState, executor: Any = None) -> Any
                 self.end_headers()
                 self.wfile.write(body)
                 self.wfile.flush()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception("Error serving dashboard GET %s: %s", self.path, e)
+                try:
+                    err_body = f"<h1>Error 500</h1><pre>{e}</pre>".encode("utf-8")
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                    self.wfile.flush()
+                except Exception:
+                    pass
 
         def log_message(self, format: str, *args: Any) -> None:
             # Silenciar logs para no saturar consola
@@ -238,7 +269,8 @@ def start_web_server(port: int, state: MarketState, executor: Any = None) -> Any
     try:
         server = DualStackServer(("::", port), DashboardHandler)
         listen_addr = f"[::]:{port}"
-    except Exception:
+    except Exception as e:
+        logger.warning("DualStackServer (::) failed (%s), falling back to 0.0.0.0:%d", e, port)
         server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
         listen_addr = f"0.0.0.0:{port}"
 
