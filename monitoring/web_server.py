@@ -207,8 +207,13 @@ def render_dashboard(state: MarketState, executor: Any = None) -> str:
 """
 
 
-def start_web_server(port: int, state: MarketState, executor: Any = None) -> ThreadingHTTPServer:
-    """Inicia el servidor HTTP estándar en un hilo demonio."""
+def start_web_server(port: int, state: MarketState, executor: Any = None) -> Any:
+    """Inicia el servidor HTTP estándar dual-stack (IPv4 + IPv6) en un hilo demonio."""
+    import socket
+
+    class DualStackServer(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
     class DashboardHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -219,6 +224,7 @@ def start_web_server(port: int, state: MarketState, executor: Any = None) -> Thr
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
                 self.wfile.flush()
@@ -229,8 +235,14 @@ def start_web_server(port: int, state: MarketState, executor: Any = None) -> Thr
             # Silenciar logs para no saturar consola
             pass
 
-    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
+    try:
+        server = DualStackServer(("::", port), DashboardHandler)
+        listen_addr = f"[::]:{port}"
+    except Exception:
+        server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
+        listen_addr = f"0.0.0.0:{port}"
+
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="web_dashboard")
     thread.start()
-    logger.info("Web dashboard HTTP server listening on 0.0.0.0:%d (thread daemon)", port)
+    logger.info("Web dashboard HTTP server listening on %s (thread daemon)", listen_addr)
     return server
