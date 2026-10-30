@@ -445,6 +445,38 @@ async def main() -> None:
                     logger.warning("Telegram no disponible: %s — bot continua sin alertas", e)
                     return
 
+        async def dashboard_loop() -> None:
+            """Inicia el dashboard Streamlit en el puerto HTTP (8080 en Fly.io)."""
+            is_fly = bool(os.environ.get("FLY_APP_NAME"))
+            enable_dashboard = os.environ.get("ENABLE_DASHBOARD", "1" if is_fly else "0") == "1"
+            if not enable_dashboard:
+                return
+
+            port = os.environ.get("PORT", "8080")
+            cmd = [
+                sys.executable, "-m", "streamlit", "run", "monitoring/dashboard.py",
+                "--server.port", str(port),
+                "--server.address", "0.0.0.0",
+                "--server.headless", "true",
+                "--browser.gatherUsageStats", "false",
+            ]
+            try:
+                logger.info("Iniciando Dashboard Web en puerto %s...", port)
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                logger.info("Dashboard Web activo (PID %d) en http://0.0.0.0:%s", proc.pid, port)
+                try:
+                    await proc.wait()
+                finally:
+                    if proc.returncode is None:
+                        proc.terminate()
+                        await proc.wait()
+            except Exception as e:
+                logger.warning("No se pudo iniciar el dashboard web: %s", e)
+
         tasks = [
             asyncio.create_task(db_worker.run(), name="db_worker"),
             asyncio.create_task(ingestor.run(db), name="ingestor"),
@@ -453,6 +485,7 @@ async def main() -> None:
             asyncio.create_task(heartbeat_loop(), name="heartbeat"),
             asyncio.create_task(shadow_pnl_resolver_loop(), name="shadow_pnl_resolver"),
             asyncio.create_task(telegram_loop(), name="telegram"),
+            asyncio.create_task(dashboard_loop(), name="dashboard"),
         ]
 
         await asyncio.gather(*tasks)
