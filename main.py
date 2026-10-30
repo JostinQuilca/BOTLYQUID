@@ -446,36 +446,15 @@ async def main() -> None:
                     return
 
         async def dashboard_loop() -> None:
-            """Inicia el dashboard Streamlit en el puerto HTTP (8080 en Fly.io)."""
-            is_fly = bool(os.environ.get("FLY_APP_NAME"))
-            enable_dashboard = os.environ.get("ENABLE_DASHBOARD", "1" if is_fly else "0") == "1"
-            if not enable_dashboard:
-                return
-
-            port = os.environ.get("PORT", "8080")
-            cmd = [
-                sys.executable, "-m", "streamlit", "run", "monitoring/dashboard.py",
-                "--server.port", str(port),
-                "--server.address", "0.0.0.0",
-                "--server.headless", "true",
-                "--browser.gatherUsageStats", "false",
-            ]
+            """Inicia el dashboard web HTTP nativo en el puerto 8080 (Fly.io)."""
+            from monitoring.web_server import start_web_server
+            port = int(os.environ.get("PORT", "8080"))
             try:
-                logger.info("Iniciando Dashboard Web en puerto %s...", port)
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                logger.info("Dashboard Web activo (PID %d) en http://0.0.0.0:%s", proc.pid, port)
-                try:
-                    await proc.wait()
-                finally:
-                    if proc.returncode is None:
-                        proc.terminate()
-                        await proc.wait()
+                server = await start_web_server(port, market_state, executor)
+                async with server:
+                    await server.serve_forever()
             except Exception as e:
-                logger.warning("No se pudo iniciar el dashboard web: %s", e)
+                logger.warning("No se pudo iniciar el dashboard web en puerto %d: %s", port, e)
 
         tasks = [
             asyncio.create_task(db_worker.run(), name="db_worker"),
