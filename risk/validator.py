@@ -63,7 +63,7 @@ class RiskValidator:
     """
 
     # Umbrales de salud del sistema
-    MAX_TICK_AGE_MS = 5_000
+    MAX_TICK_AGE_MS = 3_000
     MAX_CLOCK_SKEW_MS = 5_000
 
     # Reglas de microestructura
@@ -91,7 +91,7 @@ class RiskValidator:
         self,
         signal: SignalProposal,
         state: MarketState,
-        shadow_mode: bool = True,
+        shadow_mode: bool = False,
     ) -> ApprovedOrder:
         """
         Valida una señal y retorna un ApprovedOrder.

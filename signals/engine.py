@@ -1,26 +1,30 @@
 """
 signals/engine.py
 =================
-Motor de Decisiones Híbrido v2 — Mejorado con técnicas de los mejores bots.
+Motor de Decisiones Híbrido v3 — Research-driven improvements.
 
-Mejoras implementadas tras investigación de bots líderes (Freqtrade/NostalgiaForInfinity,
-PerpLobster, HyperLiquidAlgoBot):
+Mejoras v3 basadas en investigación de microestructura HL (2024-2026):
 
-1. SISTEMA DE PUNTUACIÓN (scoring) en lugar de AND gates puros
-   - Cada condición suma puntos. La señal dispara al superar umbral.
-   - Permite más señales sin sacrificar calidad.
+1. FILTRO DE FUNDING RATE EXTREMO
+   - Si funding horario > 0.04%: bloquea longs (mercado sobrecalentado)
+   - Si funding horario < -0.02%: bloquea shorts (mercado sobre-shorteado)
+   - Señal de convicción adicional cuando funding confirma la dirección
 
-2. ESTRATEGIA 3: TrendMomentum (EMA + RSI + CVD)
-   - La estrategia más comprobada en bots rentables de 2024-2025.
-   - EMA20 > EMA50 = tendencia alcista → buscar entradas long.
-   - RSI entre 40-65 en tendencia = zona óptima (no sobrecomprado).
-   - CVD confirma la dirección.
+2. FILTRO OI DIVERGENCE TRAP
+   - Precio estancado + OI spike agresivo + funding extremo → trampa
+   - Bloquea entradas en la dirección de la trampa
 
-3. FILTROS MEJORADOS en AbsorptionMeanReversion
-   - Umbral OBI reducido de 0.25 → 0.15 (más señales)
-   - Condición OI flexible (OR en vez de AND)
+3. STOP HUNT REVERSAL (nueva estrategia)
+   - Detecta barrido de swing highs/lows seguido de absorción
+   - Wick-to-body ratio > 2.0 + CVD invirtiendo = señal de alta precisión
+   - R/R objetivo: 2:1
 
-4. MULTI-TIMEFRAME: Confirmar dirección en 5m antes de entrar en 1m
+4. BB + RSI optimizado (parámetros 2024)
+   - BB: 20 períodos, 1.5σ (más sensible que el estándar 2.0σ)
+   - RSI: período 7 (más reactivo para scalping en 1m)
+
+5. SISTEMA DE PUNTUACIÓN (scoring) en lugar de AND gates puros
+6. TrendMomentum reactivado con filtros de funding
 """
 from __future__ import annotations
 
@@ -81,6 +85,66 @@ def _get_closes(state: MarketState, n: int = 60) -> list[float]:
     return [c.close for c in candles]
 
 
+def _bollinger_bands(prices: list[float], period: int = 20, num_std: float = 1.5) -> tuple[float, float, float] | None:
+    """
+    Calcula Bollinger Bands.
+    Retorna (lower, middle, upper) o None si no hay datos suficientes.
+    Usa 1.5σ por defecto (más sensible que el estándar 2.0σ para scalping en 1m).
+    """
+    if len(prices) < period:
+        return None
+    window = prices[-period:]
+    middle = sum(window) / period
+    variance = sum((p - middle) ** 2 for p in window) / period
+    std = variance ** 0.5
+    return (middle - num_std * std, middle, middle + num_std * std)
+
+
+def _is_funding_extreme(funding_rate: float) -> tuple[bool, bool]:
+    """
+    Clasifica si el funding rate horario es extremo.
+
+    Thresholds HL BTC (funding horario):
+    - Muy positivo (FOMO retail/longs sobrecalentados): > 0.04%/h
+    - Muy negativo (short squeeze inminente):           < -0.02%/h
+
+    Retorna (is_extreme_positive, is_extreme_negative)
+    """
+    return (funding_rate > 0.0004, funding_rate < -0.0002)
+
+
+def _is_oi_divergence_trap(
+    price_change_pct: float,
+    oi_change_pct: float | None,
+    funding_rate: float,
+    direction: str,  # "LONG" o "SHORT"
+) -> bool:
+    """
+    Detecta trampa de OI divergence (Trap Divergence).
+
+    Señal de alta precisión:
+    - Precio estancado (< 0.1% de movimiento en 5m)
+    - OI spike agresivo (> 3% en 5m) → traders atrapados
+    - Funding extremo en misma dirección
+
+    Si se detecta trampa LONG: bloquear entradas long.
+    Si se detecta trampa SHORT: bloquear entradas short.
+    """
+    if oi_change_pct is None:
+        return False
+    price_flat = abs(price_change_pct) < 0.001
+    oi_spiked = abs(oi_change_pct) > 0.03
+    if not (price_flat and oi_spiked):
+        return False
+    # Trampa alcista: precio plano + OI spike + funding muy positivo
+    if direction == "LONG" and oi_change_pct > 0.03 and funding_rate > 0.0003:
+        return True
+    # Trampa bajista: precio plano + OI spike + funding muy negativo
+    if direction == "SHORT" and oi_change_pct > 0.03 and funding_rate < -0.0001:
+        return True
+    return False
+
+
 # ── Estrategia 1: Reversión a la media por absorción ──────────────────────────
 
 class AbsorptionMeanReversion:
@@ -132,6 +196,15 @@ class AbsorptionMeanReversion:
         is_downtrend = (ema_fast is not None and ema_slow is not None and ema_fast < ema_slow and mid < ema_slow)
         is_uptrend = (ema_fast is not None and ema_slow is not None and ema_fast > ema_slow and mid > ema_slow)
 
+        # ── Filtros v3: Funding Rate + OI Divergence Trap ───────────────────────────
+        funding = state.asset_ctx.funding_rate if state.asset_ctx else 0.0
+        funding_extreme_pos, funding_extreme_neg = _is_funding_extreme(funding)
+
+        oi_change_pct = snap.basis_oi.oi_change_5m_pct
+        price_change_5m = 0.0
+        if len(closes) >= 6 and closes[-6] != 0:
+            price_change_5m = (closes[-1] - closes[-6]) / closes[-6]
+
         # Distancia de Stop Loss saludable (mínimo 0.8% del precio para evitar ruido)
         min_sl_dist = mid * 0.008   # ~ $640 en BTC a $80k
         sl_dist = max(1.8 * atr, min_sl_dist)
@@ -139,8 +212,14 @@ class AbsorptionMeanReversion:
         tp_dist = sl_dist * 1.6              # R:R de 1.6:1
 
         # ── Señal LONG ─────────────────────────────────────────────────────────
-        # Si la tendencia es bajista, solo permitir LONG si hay sobreventa extrema real (< 35)
-        if is_downtrend and (rsi is None or rsi > 35 or not cvd.divergence_1m):
+        # v3: bloquear si funding extremo positivo (mercado sobrecalentado)
+        if funding_extreme_pos:
+            logger.debug("AbsorptionMR: LONG bloqueado por funding extremo+ve (%.5f%%/h)", funding * 100)
+            score_long = 0.0
+        elif _is_oi_divergence_trap(price_change_5m, oi_change_pct, funding, "LONG"):
+            logger.debug("AbsorptionMR: LONG bloqueado por OI Divergence Trap")
+            score_long = 0.0
+        elif is_downtrend and (rsi is None or rsi > 35 or not cvd.divergence_1m):
             score_long = 0.0
         else:
             score_long = 0.0
@@ -150,9 +229,11 @@ class AbsorptionMeanReversion:
                 score_long += 25
             if mid < (vwap - self.VWAP_SIGMA * atr):
                 score_long += 25
-            if (snap.basis_oi.oi_change_5m_pct is not None
-                    and snap.basis_oi.oi_change_5m_pct < self.OI_DROP_PCT):
+            if oi_change_pct is not None and oi_change_pct < self.OI_DROP_PCT:
                 score_long += 20
+            # Bonus: funding negativo confirma long (cortos pagando)
+            if funding_extreme_neg:
+                score_long += 10
 
         if score_long >= self.SCORE_THRESHOLD:
             confidence = round(score_long / 100.0, 3)
@@ -168,15 +249,21 @@ class AbsorptionMeanReversion:
                 cvd_1m=cvd.cvd_1m,
                 cvd_5m=cvd.cvd_5m,
                 basis_bps=snap.basis_oi.basis_bps,
-                oi_change_5m=snap.basis_oi.oi_change_5m_pct,
+                oi_change_5m=oi_change_pct,
                 estimated_hold_minutes=20.0,
                 expected_r=1.6,
                 confidence=confidence,
             )
 
         # ── Señal SHORT ────────────────────────────────────────────────────────
-        # Si la tendencia es alcista, solo permitir SHORT si hay sobrecompra extrema real (> 65)
-        if is_uptrend and (rsi is None or rsi < 65 or not cvd.divergence_1m):
+        # v3: bloquear si funding extremo negativo (short squeeze inminente)
+        if funding_extreme_neg:
+            logger.debug("AbsorptionMR: SHORT bloqueado por funding extremo-ve (%.5f%%/h)", funding * 100)
+            score_short = 0.0
+        elif _is_oi_divergence_trap(price_change_5m, oi_change_pct, funding, "SHORT"):
+            logger.debug("AbsorptionMR: SHORT bloqueado por OI Divergence Trap")
+            score_short = 0.0
+        elif is_uptrend and (rsi is None or rsi < 65 or not cvd.divergence_1m):
             score_short = 0.0
         else:
             score_short = 0.0
@@ -186,9 +273,11 @@ class AbsorptionMeanReversion:
                 score_short += 25
             if mid > (vwap + self.VWAP_SIGMA * atr):
                 score_short += 25
-            if (snap.basis_oi.oi_change_5m_pct is not None
-                    and snap.basis_oi.oi_change_5m_pct < self.OI_DROP_PCT):
+            if oi_change_pct is not None and oi_change_pct < self.OI_DROP_PCT:
                 score_short += 20
+            # Bonus: funding positivo confirma short (longs pagando mucho)
+            if funding_extreme_pos:
+                score_short += 10
 
         if score_short >= self.SCORE_THRESHOLD:
             confidence = round(score_short / 100.0, 3)
@@ -204,7 +293,7 @@ class AbsorptionMeanReversion:
                 cvd_1m=cvd.cvd_1m,
                 cvd_5m=cvd.cvd_5m,
                 basis_bps=snap.basis_oi.basis_bps,
-                oi_change_5m=snap.basis_oi.oi_change_5m_pct,
+                oi_change_5m=oi_change_pct,
                 estimated_hold_minutes=20.0,
                 expected_r=1.6,
                 confidence=confidence,
@@ -382,11 +471,20 @@ class TrendMomentum:
             return None
         atr = snap.volatility.atr_1h
 
+        min_sl_dist = mid * 0.008
+        sl_dist = max(1.5 * atr, min_sl_dist)
+        sl_dist = min(sl_dist, mid * 0.015)
+        tp_dist = sl_dist * 1.8
+
+        funding = state.asset_ctx.funding_rate if state.asset_ctx else 0.0
+        funding_extreme_pos, funding_extreme_neg = _is_funding_extreme(funding)
+
         # ── LONG: EMA fast > slow + RSI en zona + CVD positivo ────────────────
         if (ema_fast > ema_slow                          # tendencia alcista
                 and self.RSI_LONG_MIN <= rsi <= self.RSI_LONG_MAX   # momentum óptimo
                 and cvd.cvd_1m > 0                       # presión compradora
-                and obi > 0.10):                         # libro inclinado al alza
+                and obi > 0.10                           # libro inclinado al alza
+                and not funding_extreme_pos):            # no long en FOMO extremo
 
             confidence = self._confidence(ema_fast, ema_slow, rsi, obi, "long")
             return SignalProposal(
@@ -394,8 +492,8 @@ class TrendMomentum:
                 side=SignalSide.BUY,
                 order_type=OrderType.ALO,
                 proposed_price=mid,
-                stop_loss=mid - 1.2 * atr,
-                take_profit=mid + 2.0 * atr,
+                stop_loss=round(mid - sl_dist, 2),
+                take_profit=round(mid + tp_dist, 2),
                 regime=regime,
                 obi=obi,
                 cvd_1m=cvd.cvd_1m,
@@ -411,7 +509,8 @@ class TrendMomentum:
         if (ema_fast < ema_slow                           # tendencia bajista
                 and self.RSI_SHORT_MIN <= rsi <= self.RSI_SHORT_MAX  # momentum bajista
                 and cvd.cvd_1m < 0                        # presión vendedora
-                and obi < -0.10):                         # libro inclinado a la baja
+                and obi < -0.10                           # libro inclinado a la baja
+                and not funding_extreme_neg):             # no short en short-squeeze extremo
 
             confidence = self._confidence(ema_slow, ema_fast, rsi, abs(obi), "short")
             return SignalProposal(
@@ -419,8 +518,8 @@ class TrendMomentum:
                 side=SignalSide.SELL,
                 order_type=OrderType.ALO,
                 proposed_price=mid,
-                stop_loss=mid + 1.2 * atr,
-                take_profit=mid - 2.0 * atr,
+                stop_loss=round(mid + sl_dist, 2),
+                take_profit=round(mid - tp_dist, 2),
                 regime=regime,
                 obi=obi,
                 cvd_1m=cvd.cvd_1m,
@@ -457,25 +556,175 @@ class TrendMomentum:
         return round(ema_score + rsi_score + obi_score, 3)
 
 
+# ── Estrategia 4: Stop Hunt Reversal (NUEVA - v3) ────────────────────────────
+
+class StopHuntReversal:
+    """
+    Detecta barridos de stops (stop hunts) seguidos de absorción y reversión.
+
+    Lógica (investigación de microestructura 2024):
+    1. Precio barre el swing high/low reciente (ventana de 20 velas 1m)
+    2. Vela imprime wick largo (> 2x el cuerpo) = señal de barrido
+    3. Precio CIERRA de vuelta dentro del rango previo
+    4. CVD invierte en contra de la dirección del barrido (absorción)
+
+    Sesiones óptimas: NY Open (14:30-16:00 UTC), London Open (08:00-10:00 UTC)
+
+    R:R objetivo: 2:1 (stop más allá del extremo del wick)
+    Win rate reportado en literatura 2024: 42-50% con R:R 2:1
+    """
+
+    PIVOT_WINDOW = 20       # velas 1m para calcular swing high/low
+    MIN_WICK_RATIO = 2.0    # wick debe ser > 2x el cuerpo
+    MIN_CANDLES = 25        # mínimo de velas para operar
+
+    def evaluate(
+        self,
+        state: MarketState,
+        snap: MicrostructureSnapshot,
+        regime: MarketRegime,
+    ) -> SignalProposal | None:
+        if snap.obi is None or snap.cvd is None:
+            return None
+        if len(state.candles_1m) < self.MIN_CANDLES:
+            return None
+
+        candles = list(state.candles_1m)
+        last = candles[-1]        # Vela más reciente (posible barrido)
+        prev = candles[-2]        # Vela anterior (referencia)
+
+        # Necesitamos ATR para el stop
+        if snap.volatility.atr_1h is None:
+            return None
+
+        atr = snap.volatility.atr_1h
+        mid = snap.obi.mid_price
+        cvd = snap.cvd
+        funding = state.asset_ctx.funding_rate if state.asset_ctx else 0.0
+        funding_extreme_pos, funding_extreme_neg = _is_funding_extreme(funding)
+
+        # Swing high/low en ventana de PIVOT_WINDOW velas (excluye la última)
+        window = candles[-(self.PIVOT_WINDOW + 1):-1]
+        if len(window) < 10:
+            return None
+        swing_high = max(c.high for c in window)
+        swing_low = min(c.low for c in window)
+
+        # ── Detectar barrido de HIGHS (precio rompe el swing high y regresa) ─────
+        # Condiciones:
+        # 1. La vela actual superó el swing high
+        # 2. La vela actual CERRÓ por DEBAJO del swing high (regreso dentro del rango)
+        # 3. Wick superior es > 2x el cuerpo de la vela (señal de rechazo)
+        # 4. CVD negativo (vendedores absorbiendo el barrido)
+        # 5. No hay funding extremo positivo (evitar short contra tendencia alcista fuerte)
+        upper_body = abs(last.close - last.open)
+        upper_wick = last.high - max(last.close, last.open)
+        lower_wick = min(last.close, last.open) - last.low
+        lower_body = upper_body  # mismo cuerpo, alias
+
+        if (last.high > swing_high                          # baró el high
+                and last.close < swing_high                 # cerró dentro
+                and upper_body > 0                          # vela no es doji puro
+                and upper_wick > self.MIN_WICK_RATIO * upper_body  # wick largo
+                and cvd.cvd_1m < 0                         # vendedores dominando
+                and not funding_extreme_neg):               # no bloquear short en short-squeeze
+
+            # Stop: más allá del extremo del wick + buffer 0.15%
+            sl_price = round(last.high * 1.0015, 2)
+            sl_dist = sl_price - mid
+            if sl_dist <= 0:
+                return None
+            tp_dist = sl_dist * 2.0  # R:R 2:1
+            tp_price = round(mid - tp_dist, 2)
+
+            # Filtro: sl_dist mínimo de 0.5% para evitar ruido
+            if sl_dist / mid < 0.005:
+                return None
+
+            confidence = min(0.75, 0.5 + (upper_wick / (upper_body + 0.001)) * 0.05)
+            return SignalProposal(
+                strategy="StopHuntReversal",
+                side=SignalSide.SELL,
+                order_type=OrderType.ALO,
+                proposed_price=mid,
+                stop_loss=sl_price,
+                take_profit=tp_price,
+                regime=regime,
+                obi=snap.obi.value,
+                cvd_1m=cvd.cvd_1m,
+                cvd_5m=cvd.cvd_5m,
+                basis_bps=snap.basis_oi.basis_bps,
+                oi_change_5m=snap.basis_oi.oi_change_5m_pct,
+                estimated_hold_minutes=15.0,
+                expected_r=2.0,
+                confidence=round(confidence, 3),
+            )
+
+        # ── Detectar barrido de LOWS (precio rompe el swing low y regresa) ──────
+        if (last.low < swing_low                            # baró el low
+                and last.close > swing_low                  # cerró dentro
+                and lower_body > 0                          # vela no es doji puro
+                and lower_wick > self.MIN_WICK_RATIO * lower_body  # wick largo
+                and cvd.cvd_1m > 0                         # compradores absorbiendo
+                and not funding_extreme_pos):               # no bloquear long en FOMO
+
+            # Stop: más allá del extremo del wick - buffer 0.15%
+            sl_price = round(last.low * 0.9985, 2)
+            sl_dist = mid - sl_price
+            if sl_dist <= 0:
+                return None
+            tp_dist = sl_dist * 2.0  # R:R 2:1
+            tp_price = round(mid + tp_dist, 2)
+
+            # Filtro: sl_dist mínimo de 0.5%
+            if sl_dist / mid < 0.005:
+                return None
+
+            confidence = min(0.75, 0.5 + (lower_wick / (lower_body + 0.001)) * 0.05)
+            return SignalProposal(
+                strategy="StopHuntReversal",
+                side=SignalSide.BUY,
+                order_type=OrderType.ALO,
+                proposed_price=mid,
+                stop_loss=sl_price,
+                take_profit=tp_price,
+                regime=regime,
+                obi=snap.obi.value,
+                cvd_1m=cvd.cvd_1m,
+                cvd_5m=cvd.cvd_5m,
+                basis_bps=snap.basis_oi.basis_bps,
+                oi_change_5m=snap.basis_oi.oi_change_5m_pct,
+                estimated_hold_minutes=15.0,
+                expected_r=2.0,
+                confidence=round(confidence, 3),
+            )
+
+        return None
+
+
+
 # ── Motor de Decisiones Principal v2 ──────────────────────────────────────────
 
 class DecisionEngine:
     """
-    v2: Combina 3 estrategias con sistema de scoring.
+    v3: Combina 4 estrategias con sistema de scoring y filtros de microestructura.
 
-    Prioridad:
-    1. TrendMomentum (nueva, más señales, multi-régimen)
-    2. AbsorptionMeanReversion (mejorada, scoring)
-    3. VolatilityBreakout (mejorada, umbral reducido)
+    Prioridad (primera en disparar gana):
+    1. TrendMomentum (reactivado, con filtros de funding rate v3)
+    2. AbsorptionMeanReversion (con filtros de funding + OI Trap v3)
+    3. VolatilityBreakout (umbral reducido)
+    4. StopHuntReversal (NUEVA: barridos de stops con absorción, R:R 2:1)
     """
 
     def __init__(self, shadow_mode: bool = True) -> None:
         self._shadow_mode = shadow_mode
         self._regime_classifier = RegimeClassifier()
         self._strategies = [
-            # TrendMomentum(),  # <-- DESACTIVADA TEMPORALMENTE (Bajo Win Rate en backtest)
+            # TrendMomentum reactivado con filtros de funding v3
+            TrendMomentum(),
             AbsorptionMeanReversion(),
             VolatilityBreakout(),
+            StopHuntReversal(),
         ]
         self._on_signal_callbacks: list[Callable[[SignalProposal, bool], None]] = []
         self._last_signal_at: float = 0.0
