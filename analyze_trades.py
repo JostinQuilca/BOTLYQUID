@@ -37,3 +37,4 @@ for f in closed:
     dir_ = f['dir']
     neto = pnl - fee
     print(f"  {dir_:12s} @ {px:,.0f} | PnL: {pnl:+.4f} | Fee: -{fee:.4f} | Neto: {neto:+.4f}")
+

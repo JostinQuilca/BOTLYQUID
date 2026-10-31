@@ -71,6 +71,9 @@ class RiskValidator:
     MIN_MARGIN_TO_SL_RATIO = 2.5   # Distancia a liquidación >= 2.5x distancia al SL
     FUNDING_ADVERSE_ANNUALIZED_PCT = 25.0   # 25% anualizado = funding adverso
 
+    # v4: Límite de trades por día (extra seguridad, el motor también lo controla)
+    MAX_TRADES_PER_DAY = 2
+
     def __init__(
         self,
         db: aiosqlite.Connection,
@@ -114,6 +117,10 @@ class RiskValidator:
         # 4b. Cooldown tras pérdida reciente en la misma dirección
         if not shadow_mode:
             await self._check_loss_cooldown(signal)
+
+        # 4c. v4: Límite de trades por día
+        if not shadow_mode:
+            await self._check_daily_trade_count()
 
         # 5. Dimensionamiento
         equity = state.account.equity or risk_state.equity_open
@@ -308,6 +315,31 @@ class RiskValidator:
                 VetoReason.RISK_MAX_POSITION,
                 f"Already have an open position: {state.account.position_size:.6f} BTC",
             )
+
+    async def _check_daily_trade_count(self) -> None:
+        """
+        v4: Máximo MAX_TRADES_PER_DAY trades por día calendario (UTC).
+        Bloquea nuevas entradas si ya se alcanzó el límite.
+        """
+        today = date.today().isoformat()
+        try:
+            async with self._db.execute(
+                "SELECT COUNT(*) FROM live_fills WHERE dir LIKE 'Open%' AND DATE(ts_ms/1000, 'unixepoch') = ?",
+                (today,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                count = row[0] if row else 0
+
+            if count >= self.MAX_TRADES_PER_DAY:
+                raise VetoException(
+                    VetoReason.RISK_DAILY_LIMIT,
+                    f"Limite diario de trades: {count}/{self.MAX_TRADES_PER_DAY} hoy ({today}). "
+                    f"Reactivando manana.",
+                )
+        except VetoException:
+            raise
+        except Exception as e:
+            logger.debug("Error verificando trades del dia: %s", e)
 
     async def _check_loss_cooldown(self, signal: SignalProposal) -> None:
         """

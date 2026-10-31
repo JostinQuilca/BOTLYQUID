@@ -273,6 +273,8 @@ async def main() -> None:
                                     alert_type="SIGNAL",
                                 )
                                 await executor.execute(approved)
+                                # v4: Registrar trade en el motor para el límite diario
+                                decision_engine.register_trade_executed()
 
                         except Exception as veto:
                             logger.info("Signal vetoed: %s", veto)
