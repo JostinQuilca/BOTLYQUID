@@ -62,9 +62,9 @@ class RiskValidator:
     5. Reglas de microestructura (precio, funding, distancia a liquidación)
     """
 
-    # Umbrales de salud del sistema
-    MAX_TICK_AGE_MS = 3_000
-    MAX_CLOCK_SKEW_MS = 5_000
+    # Umbrales de salud del sistema (tolerancia cloud para micro-latencias WS)
+    MAX_TICK_AGE_MS = 10_000
+    MAX_CLOCK_SKEW_MS = 10_000
 
     # Reglas de microestructura
     MAX_PRICE_DEVIATION_BPS = 20    # 0.2% del mid price

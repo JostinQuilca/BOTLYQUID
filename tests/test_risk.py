@@ -122,7 +122,7 @@ class TestSystemHealth:
     async def test_stale_tick_vetoed(self, mock_db):
         """Tick viejo (> 3000ms) debe ser vetado."""
         state = make_healthy_state()
-        state._last_ws_message_at = time.monotonic() - 5.0  # 5 segundos sin tick
+        state._last_ws_message_at = time.monotonic() - 15.0  # 15 segundos sin tick
 
         validator = RiskValidator(mock_db, settings=make_test_settings())
 

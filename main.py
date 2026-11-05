@@ -315,6 +315,17 @@ async def main() -> None:
                             logger.info("Signal vetoed: %s", veto)
                             # Marcar señal rechazada → cooldown 60s anti-spam
                             decision_engine.mark_signal_rejected(60.0)
+                            if not settings.shadow_mode and alerter:
+                                try:
+                                    await alerter.send(
+                                        f"🛡️ *SEÑAL VETADA POR RIESGO*\n"
+                                        f"Estrategia: `{signal.strategy}` ({signal.side.value if hasattr(signal.side, 'value') else signal.side})\n"
+                                        f"Motivo: `{str(veto)}`\n"
+                                        f"Capital protegido. Reevaluando en 60s...",
+                                        alert_type="WARNING",
+                                    )
+                                except Exception:
+                                    pass
                             await db_worker.put(
                                 DBEvent(
                                     table="decisions",
