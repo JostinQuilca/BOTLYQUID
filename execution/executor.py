@@ -182,7 +182,7 @@ class HyperliquidExecutor:
                 approved.approved_size,
                 order_px,
                 {"limit": {"tif": "Alo"}},
-                cloid,
+                cloid=cloid,
             )
             logger.info("ALO order result from exchange: %s (px=%.1f)", result, order_px)
             if isinstance(result, dict) and result.get("status") == "err":
@@ -229,7 +229,8 @@ class HyperliquidExecutor:
             order_px = round(approved.approved_price, 2)
 
         try:
-            result = self._exchange.order(
+            result = await asyncio.to_thread(
+                self._exchange.order,
                 self._symbol,
                 is_buy,
                 approved.approved_size,
@@ -387,7 +388,7 @@ class HyperliquidExecutor:
         async with self._protect_lock:
             # Limpiar órdenes huérfanas previas antes de recolocar el par TP/SL limpio
             try:
-                self._exchange.cancel_all(self._symbol)
+                await asyncio.to_thread(self._exchange.cancel_all, self._symbol)
             except Exception:
                 pass
             await self._place_tp_sl_with_retry(entry_price, size, is_long_fallback=is_long_fallback)
@@ -432,7 +433,8 @@ class HyperliquidExecutor:
         for attempt in range(1, self.SL_MAX_RETRIES + 1):
             try:
                 # 1. Colocar Stop Loss
-                sl_res = self._exchange.order(
+                sl_res = await asyncio.to_thread(
+                    self._exchange.order,
                     self._symbol,
                     sl_side,
                     fill_size,
@@ -443,7 +445,8 @@ class HyperliquidExecutor:
                 logger.info("SL order result (attempt %d): %s @ %.1f", attempt, sl_res, stop_price)
 
                 # 2. Colocar Take Profit
-                tp_res = self._exchange.order(
+                tp_res = await asyncio.to_thread(
+                    self._exchange.order,
                     self._symbol,
                     tp_side,
                     fill_size,
@@ -634,7 +637,7 @@ class HyperliquidExecutor:
                 # Cancelar SL anterior y colocar nuevo SL en break-even
                 if self._active_sl_oid:
                     await asyncio.to_thread(
-                        self._exchange.cancel, self._symbol, [{"a": 0, "o": self._active_sl_oid}]
+                        self._exchange.cancel, self._symbol, int(self._active_sl_oid)
                     )
                 sl_side = not is_long
                 sl_res = await asyncio.to_thread(
@@ -644,7 +647,7 @@ class HyperliquidExecutor:
                     self._filled_size,
                     be_price,
                     {"trigger": {"isMarket": True, "triggerPx": be_price, "tpsl": "sl"}},
-                    True,  # reduce_only
+                    reduce_only=True,
                 )
                 self._active_sl_oid = None
                 statuses = sl_res.get("response", {}).get("data", {}).get("statuses", [{}]) if isinstance(sl_res, dict) else [{}]

@@ -148,7 +148,20 @@ async def main() -> None:
         await set_bot_state(db, BotProcessState.HALTED, {"reason": "kill_switch"})
 
     async def pause_fn(seconds: int) -> None:
-        logger.info("Bot paused for %ds via Telegram", seconds)
+        import time as _time
+        paused_until = _time.time() + seconds
+        try:
+            await db.execute(
+                """
+                INSERT INTO bot_config (key, value) VALUES ('paused_until', ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (str(paused_until),),
+            )
+            await db.commit()
+            logger.info("Bot paused for %ds (until %.0f) via Telegram", seconds, paused_until)
+        except Exception:
+            logger.exception("Error persisting pause_fn to SQLite")
 
     telegram_app, alerter = build_telegram_app(
         market_state=market_state,
@@ -166,9 +179,17 @@ async def main() -> None:
     # ── 6. Bucle principal ─────────────────────────────────────────────────────
     async def signal_evaluation_loop() -> None:
         """Evalua señales cada 1 segundo (en velas de 1m)."""
+        _last_manage_at: float = 0.0
         while True:
             await asyncio.sleep(1.0)
             try:
+                now = time.monotonic()
+
+                # ── Gestión activa de posición abierta (cada 5s) ──────────────
+                if executor and (now - _last_manage_at) >= 5.0:
+                    _last_manage_at = now
+                    await executor.manage_open_position(market_state)
+
                 if market_state.is_warm:
                     signal = decision_engine.evaluate(market_state)
 
@@ -181,11 +202,13 @@ async def main() -> None:
                             blocked, reason = ext.should_block_long()
                             if blocked:
                                 logger.info("Signal LONG bloqueada por señal externa: %s", reason)
+                                decision_engine.mark_signal_rejected(60.0)
                                 continue
                         elif side in ("SELL", "SHORT"):
                             blocked, reason = ext.should_block_short()
                             if blocked:
                                 logger.info("Signal SHORT bloqueada por señal externa: %s", reason)
+                                decision_engine.mark_signal_rejected(60.0)
                                 continue
 
                         # Validar con el guardián de riesgo
@@ -201,9 +224,12 @@ async def main() -> None:
                                     "Tamaño reducido x%.1f por F&G=%d (%s)",
                                     size_mult, ext.fng_value, ext.fng_label,
                                 )
+                                approved = risk_validator.apply_size_multiplier(approved, size_mult)
+
+                            # Marcar señal como despachada (cooldown anti-repainting)
+                            decision_engine.mark_signal_dispatched()
 
                             # Registrar decisión en la BD para el Dashboard
-                            # FIX #1: Usar settings.trading_symbol y campos de la señal (no market_state.microstructure)
                             await db_worker.put(
                                 DBEvent(
                                     table="decisions",
@@ -278,6 +304,8 @@ async def main() -> None:
 
                         except Exception as veto:
                             logger.info("Signal vetoed: %s", veto)
+                            # Marcar señal rechazada → cooldown 60s anti-spam
+                            decision_engine.mark_signal_rejected(60.0)
                             await db_worker.put(
                                 DBEvent(
                                     table="decisions",
@@ -421,11 +449,17 @@ async def main() -> None:
                     market_state=market_state,
                     kill_switch_fn=kill_switch_fn,
                     pause_fn=pause_fn,
+                    db=db,
+                    state_machine=state_machine,
                 )
                 try:
                     await _app.initialize()
                     await _app.start()
                     alerter = _alerter   # FIX #3: actualizar referencia tras initialize()
+                    # Re-vincular alerter al ingestor y executor tras el reinicio de Telegram
+                    ingestor.set_dependencies(executor=executor, alerter=alerter)
+                    if executor:
+                        executor.set_alerter(alerter)
                     logger.info("Telegram bot @CriptoLiquidBot activo (intento %d)", attempt)
                     await _app.updater.start_polling(drop_pending_updates=True)
                     return  # polling terminó limpiamente
