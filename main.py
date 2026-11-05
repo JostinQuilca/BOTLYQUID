@@ -148,15 +148,20 @@ async def main() -> None:
         await set_bot_state(db, BotProcessState.HALTED, {"reason": "kill_switch"})
 
     async def pause_fn(seconds: int) -> None:
-        import time as _time
-        paused_until = _time.time() + seconds
+        from datetime import date
+        today = date.today().isoformat()
+        paused_until = time.time() + seconds
+        equity_now = market_state.account.equity
         try:
             await db.execute(
                 """
-                INSERT INTO bot_config (key, value) VALUES ('paused_until', ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                INSERT INTO daily_risk (date_utc, equity_open, equity_peak, paused_until)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(date_utc) DO UPDATE SET
+                    paused_until = excluded.paused_until,
+                    updated_at = unixepoch('now', 'subsec')
                 """,
-                (str(paused_until),),
+                (today, equity_now, equity_now, paused_until),
             )
             await db.commit()
             logger.info("Bot paused for %ds (until %.0f) via Telegram", seconds, paused_until)
