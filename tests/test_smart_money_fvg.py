@@ -39,7 +39,7 @@ from microstructure.metrics import (
 )
 from risk.validator import RiskValidator, VetoException
 from signals.engine import SmartMoneyFVGReversal
-from signals.schemas import MarketRegime, SignalSide
+from signals.schemas import MarketRegime, OrderType, SignalSide
 
 
 # ── Helpers de construcción ──────────────────────────────────────────────────
@@ -519,6 +519,7 @@ class TestSmartMoneyFVGLong:
         assert result is not None, "Debe generar señal con FVG alcista válido"
         assert result.strategy == "SmartMoneyFVG"
         assert result.side == SignalSide.BUY
+        assert result.order_type == OrderType.IOC, "SmartMoneyFVG debe usar IOC para ejecución inmediata"
         assert result.stop_loss < result.proposed_price, "SL debe estar debajo del precio"
         assert result.take_profit > result.proposed_price, "TP debe estar encima del precio"
         assert result.expected_r >= 2.2, "R:R mínimo 2.2:1"
@@ -574,6 +575,7 @@ class TestSmartMoneyFVGShort:
         assert result is not None, "Debe generar señal con FVG bajista válido"
         assert result.strategy == "SmartMoneyFVG"
         assert result.side == SignalSide.SELL
+        assert result.order_type == OrderType.IOC, "SmartMoneyFVG debe usar IOC para ejecución inmediata"
         assert result.stop_loss > result.proposed_price, "SL debe estar encima del precio"
         assert result.take_profit < result.proposed_price, "TP debe estar debajo del precio"
         assert result.expected_r >= 2.2

@@ -85,6 +85,7 @@ class HyperliquidExecutor:
         self._filled_size: float = 0.0       # Acumulador de partial fills
         self._moved_to_be: bool = False       # Flag de break-even ya aplicado
         self._entry_time: float = 0.0         # Tiempo de apertura de posición
+        self.last_order_filled: bool = False  # Flag indicando si la última orden se llenó
 
         # Monitorear archivo STOP_BOT.flag
         asyncio.get_event_loop().create_task(self._monitor_kill_flag())
@@ -131,6 +132,7 @@ class HyperliquidExecutor:
         self._active_order = approved
         self._active_entry_cloid = cloid
         self._fill_event.clear()
+        self.last_order_filled = False
 
         logger.info(
             "Executing %s %s %.5f BTC @ %.2f (cloid=%s, order_type=%s, TP=%.2f, SL=%.2f)",
@@ -211,34 +213,36 @@ class HyperliquidExecutor:
                 logger.info("ALO order timed out after %.0fs, cancelling...", self.ALO_TIMEOUT_S)
                 await self._cancel_order(cloid)
                 await self._sm.transition(ExecutorState.FLAT, "ALO timeout - cancelled")
+                if self._alerter:
+                    await self._alerter.send(
+                        f"⏱ *ORDEN ALO CANCELADA*\n"
+                        f"Timeout de {self.ALO_TIMEOUT_S:.0f}s sin fill en Hyperliquid.\n"
+                        f"Capital intacto. Buscando nueva señal...",
+                        alert_type="INFO",
+                    )
 
         except Exception as e:
             await self._handle_order_error(e, "ALO entry")
 
     async def _execute_ioc(self, approved: ApprovedOrder, cloid: str) -> None:
         """
-        Orden Immediate Or Cancel (Taker, para breakouts).
+        Orden Immediate Or Cancel (Taker con market_open nativo).
         Se llena inmediatamente o se cancela.
         """
         signal = approved.signal
         is_buy = signal.side == SignalSide.BUY
 
-        if self._symbol == "BTC":
-            order_px = float(round(approved.approved_price))
-        else:
-            order_px = round(approved.approved_price, 2)
-
         try:
             result = await asyncio.to_thread(
-                self._exchange.order,
+                self._exchange.market_open,
                 self._symbol,
                 is_buy,
                 approved.approved_size,
-                order_px,
-                {"limit": {"tif": "Ioc"}},
+                px=approved.approved_price,
+                slippage=0.001,
                 cloid=cloid,
             )
-            logger.info("IOC order result from exchange: %s (px=%.1f)", result, order_px)
+            logger.info("IOC/Market order result from exchange: %s (px=%.1f)", result, approved.approved_price)
             if isinstance(result, dict) and result.get("status") == "err":
                 raise RuntimeError(f"Exchange error: {result.get('response')}")
 
@@ -251,7 +255,7 @@ class HyperliquidExecutor:
                     if "filled" in st:
                         filled = True
                         filled_data = st["filled"]
-                        fill_px = float(filled_data.get("avgPx", order_px))
+                        fill_px = float(filled_data.get("avgPx", approved.approved_price))
                         fill_sz = float(filled_data.get("totalSz", approved.approved_size))
                         oid = int(filled_data.get("oid", 0))
                         await self.on_fill(cloid, fill_px, fill_sz, oid)
@@ -260,6 +264,13 @@ class HyperliquidExecutor:
             if not filled:
                 logger.info("IOC order did not fill immediately — returning to FLAT")
                 await self._sm.transition(ExecutorState.FLAT, "IOC cancelled (no fill)")
+                if self._alerter:
+                    await self._alerter.send(
+                        f"⚠️ *ORDEN NO LLENADA*\n"
+                        f"La orden IOC para {self._symbol} no se completó en el exchange.\n"
+                        f"Capital intacto. Buscando nueva oportunidad...",
+                        alert_type="WARNING",
+                    )
 
         except Exception as e:
             await self._handle_order_error(e, "IOC entry")
@@ -299,6 +310,7 @@ class HyperliquidExecutor:
         self._filled_size = fill_size
         self._entry_time = time.monotonic()
         self._moved_to_be = False
+        self.last_order_filled = True
 
         # FIX #A: el fill puede llegar cuando el estado YA NO es ENTRY_PENDING
         # (ej.: el timeout de 15s de la ALO ya hizo ENTRY_PENDING -> FLAT justo

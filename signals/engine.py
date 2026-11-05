@@ -296,7 +296,7 @@ class SmartMoneyFVGReversal:
                 return SignalProposal(
                     strategy="SmartMoneyFVG",
                     side=SignalSide.BUY,
-                    order_type=OrderType.ALO,
+                    order_type=OrderType.IOC,
                     proposed_price=mid,
                     stop_loss=round(sl_price, 2),
                     take_profit=round(tp_price, 2),
@@ -353,7 +353,7 @@ class SmartMoneyFVGReversal:
                 return SignalProposal(
                     strategy="SmartMoneyFVG",
                     side=SignalSide.SELL,
-                    order_type=OrderType.ALO,
+                    order_type=OrderType.IOC,
                     proposed_price=mid,
                     stop_loss=round(sl_price, 2),
                     take_profit=round(tp_price, 2),

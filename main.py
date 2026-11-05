@@ -231,9 +231,6 @@ async def main() -> None:
                                 )
                                 approved = risk_validator.apply_size_multiplier(approved, size_mult)
 
-                            # Marcar señal como despachada (cooldown anti-repainting)
-                            decision_engine.mark_signal_dispatched()
-
                             # Registrar decisión en la BD para el Dashboard
                             await db_worker.put(
                                 DBEvent(
@@ -260,6 +257,7 @@ async def main() -> None:
                             )
 
                             if settings.shadow_mode:
+                                decision_engine.mark_signal_dispatched()
                                 logger.info(
                                     "SHADOW SIGNAL: %s %s @ %.2f (SL=%.2f) [F&G=%d, Funding=%+.4f%%]",
                                     signal.strategy,
@@ -304,8 +302,14 @@ async def main() -> None:
                                     alert_type="SIGNAL",
                                 )
                                 await executor.execute(approved)
-                                # v4: Registrar trade en el motor para el límite diario
-                                decision_engine.register_trade_executed()
+                                if executor.last_order_filled:
+                                    decision_engine.mark_signal_dispatched()
+                                    decision_engine.register_trade_executed()
+                                else:
+                                    logger.info(
+                                        "Orden no se llenó — esperando solo 60s sin consumir trade diario"
+                                    )
+                                    decision_engine.mark_signal_rejected(60.0)
 
                         except Exception as veto:
                             logger.info("Signal vetoed: %s", veto)
