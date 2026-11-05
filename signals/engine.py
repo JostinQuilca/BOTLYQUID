@@ -1,7 +1,7 @@
 """
 signals/engine.py
 =================
-Motor de Decisiones v4 — MODO CONSERVADOR (post-pérdidas, cuenta pequeña).
+Motor de Decisiones v5 — SmartMoneyFVGReversal + TrendMomentumV4 (modo conservador).
 
 DIAGNÓSTICO DE PÉRDIDAS (oct 2026):
 - Win rate real: 28.6% (necesitamos 45%+ para ser rentables con R:R 2:1)
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Callable
 
 from data.state import MarketState
@@ -116,12 +117,226 @@ def _is_funding_extreme(funding_rate: float) -> tuple[bool, bool]:
     return (funding_rate > 0.0003, funding_rate < -0.00015)
 
 
+
 def _avg_volume(candles: list, lookback: int = 20) -> float:
     """Volumen promedio de las últimas `lookback` velas (excluyendo la actual)."""
     if len(candles) < lookback + 1:
         return 0.0
     vols = [c.volume for c in candles[-(lookback + 1):-1]]
     return sum(vols) / len(vols) if vols else 0.0
+
+
+# ── Estrategia SmartMoneyFVGReversal (v5) ─────────────────────────────────────
+
+class SmartMoneyFVGReversal:
+    """
+    SmartMoneyFVGReversal — Estrategia institucional basada en:
+
+    1. Fair Value Gap (FVG / Imbalance ICT): zona de liquidez dejada por
+       movimiento institucional rápido (vela 1 y vela 3 no se solapan).
+    2. Vela Envolvente (Engulfing) como confirmación de absorción.
+    3. Validación de estructura (precio respetando swing high/low previo).
+    4. Orderflow en tiempo real: CVD + OBI confirman la dirección.
+    5. Bonus de Killzone NY (13:30-17:00 UTC): R:R elevado a 2.5:1.
+
+    HOT PATH SAFE: 100% cálculo en memoria, sin I/O, < 1ms.
+    Compatible con RiskValidator v2 (proposed_price = mid_price).
+
+    Win rate esperado (literatura ICT 2024): 42-55% con R:R 2.2-2.5:1
+    → Esperanza matemática positiva a partir del 32% WR con R:R 2.2:1.
+    """
+
+    MIN_CANDLES = 35
+    FVG_SEARCH_WINDOW = 10          # últimas N velas para buscar FVGs
+    MIN_FVG_ATR_RATIO = 0.15        # gap debe ser >= 15% del ATR_5m
+    OBI_MIN_THRESHOLD = 0.08        # umbral mínimo de OBI
+
+    def evaluate(
+        self,
+        state: MarketState,
+        snap: MicrostructureSnapshot,
+        regime: MarketRegime,
+    ) -> SignalProposal | None:
+
+        # ── B. Validaciones iniciales ─────────────────────────────────────────
+        if snap.obi is None or snap.cvd is None:
+            return None
+        if len(state.candles_1m) < self.MIN_CANDLES:
+            return None
+        if snap.volatility.atr_5m is None or snap.volatility.atr_1h is None:
+            return None
+
+        atr_5m = snap.volatility.atr_5m
+        mid = snap.obi.mid_price
+        obi_val = snap.obi.value
+        cvd_1m = snap.cvd.cvd_1m
+
+        # ── C.1. Velas recientes ──────────────────────────────────────────────
+        candles = list(state.candles_1m)
+        c_now = candles[-1]
+        c_prev = candles[-2]
+
+        # ── C.2. Estructura previa (swing high/low) ───────────────────────────
+        struct_candles = candles[-self.MIN_CANDLES:-self.FVG_SEARCH_WINDOW]
+        if not struct_candles:
+            return None
+        swing_high = max(c.high for c in struct_candles)
+        swing_low = min(c.low for c in struct_candles)
+
+        # ── C.3. Escanear FVGs en la ventana reciente ─────────────────────────
+        # Ventana: las últimas FVG_SEARCH_WINDOW+2 velas (excluida la actual)
+        recent = candles[-(self.FVG_SEARCH_WINDOW + 2):-1]
+
+        bullish_fvg: tuple[float, float] | None = None   # (bottom=c0.high, top=c2.low)
+        bearish_fvg: tuple[float, float] | None = None   # (bottom=c2.high, top=c0.low)
+        min_gap = atr_5m * self.MIN_FVG_ATR_RATIO
+
+        for i in range(2, len(recent)):
+            c0 = recent[i - 2]
+            c2 = recent[i]
+
+            # Bullish FVG: c2.low > c0.high (gap hacia arriba)
+            gap_bull = c2.low - c0.high
+            if gap_bull >= min_gap:
+                bullish_fvg = (c0.high, c2.low)   # guardar el último encontrado
+
+            # Bearish FVG: c0.low > c2.high (gap hacia abajo)
+            gap_bear = c0.low - c2.high
+            if gap_bear >= min_gap:
+                bearish_fvg = (c2.high, c0.low)   # guardar el último encontrado
+
+        # ── C.4. Vela Envolvente ──────────────────────────────────────────────
+        c_now_body = c_now.close - c_now.open
+        c_prev_body = c_prev.close - c_prev.open
+
+        is_bullish_engulfing = (
+            c_now.close > c_now.open                            # vela actual verde
+            and c_prev.close < c_prev.open                     # vela anterior roja
+            and c_now.close >= c_prev.open                     # cierra encima del open anterior
+            and c_now_body > abs(c_prev_body)                  # cuerpo mayor
+        )
+        is_bearish_engulfing = (
+            c_now.close < c_now.open                           # vela actual roja
+            and c_prev.close > c_prev.open                     # vela anterior verde
+            and c_now.close <= c_prev.open                     # cierra debajo del open anterior
+            and abs(c_now_body) > c_prev_body                  # cuerpo mayor
+        )
+
+        # ── C.5. Killzone Nueva York (13:30 – 17:00 UTC) ─────────────────────
+        now_utc = datetime.now(timezone.utc)
+        hour_utc = now_utc.hour + now_utc.minute / 60.0
+        in_ny_killzone = 13.5 <= hour_utc < 17.0
+
+        expected_r = 2.5 if in_ny_killzone else 2.2
+        kz_confidence_bonus = 0.08 if in_ny_killzone else 0.0
+
+        # ── D. Señal LONG ─────────────────────────────────────────────────────
+        if bullish_fvg is not None and is_bullish_engulfing:
+            fvg_bottom, fvg_top = bullish_fvg
+
+            # Precio tocó/mitigó la zona FVG
+            price_in_fvg = c_now.low <= fvg_top and c_now.close >= fvg_bottom
+
+            # Confirmación de estructura: precio respeta el swing high
+            recent_10 = candles[-10:]
+            structure_ok = max(c.high for c in recent_10) >= swing_high * 0.999
+
+            # Orderflow
+            orderflow_ok = cvd_1m > 0 and obi_val > self.OBI_MIN_THRESHOLD
+
+            if price_in_fvg and structure_ok and orderflow_ok:
+                # Stop Loss
+                sl_price = min(c_now.low, fvg_bottom) - (0.5 * atr_5m)
+                if abs(mid - sl_price) < (0.8 * atr_5m):
+                    sl_price = mid - (0.8 * atr_5m)
+                sl_dist = abs(mid - sl_price)
+
+                # Take Profit
+                tp_price = mid + (sl_dist * expected_r)
+
+                confidence = round(
+                    min(0.72 + kz_confidence_bonus + min(obi_val / 0.5, 0.15), 0.95),
+                    3,
+                )
+
+                logger.info(
+                    "SmartMoneyFVG LONG: FVG(%.1f-%.1f) engulf=True mid=%.1f "
+                    "SL=%.1f TP=%.1f R:R=%.1f KZ=%s conf=%.2f",
+                    fvg_bottom, fvg_top, mid, sl_price, tp_price, expected_r,
+                    in_ny_killzone, confidence,
+                )
+                return SignalProposal(
+                    strategy="SmartMoneyFVG",
+                    side=SignalSide.BUY,
+                    order_type=OrderType.ALO,
+                    proposed_price=mid,
+                    stop_loss=round(sl_price, 2),
+                    take_profit=round(tp_price, 2),
+                    regime=regime,
+                    obi=obi_val,
+                    cvd_1m=cvd_1m,
+                    cvd_5m=snap.cvd.cvd_5m,
+                    basis_bps=snap.basis_oi.basis_bps,
+                    oi_change_5m=snap.basis_oi.oi_change_5m_pct,
+                    estimated_hold_minutes=25.0,
+                    expected_r=expected_r,
+                    confidence=confidence,
+                )
+
+        # ── D. Señal SHORT ────────────────────────────────────────────────────
+        if bearish_fvg is not None and is_bearish_engulfing:
+            fvg_bottom, fvg_top = bearish_fvg
+
+            # Precio tocó/mitigó la zona FVG
+            price_in_fvg = c_now.high >= fvg_bottom and c_now.close <= fvg_top
+
+            # Confirmación de estructura: precio respeta el swing low
+            recent_10 = candles[-10:]
+            structure_ok = min(c.low for c in recent_10) <= swing_low * 1.001
+
+            # Orderflow
+            orderflow_ok = cvd_1m < 0 and obi_val < -self.OBI_MIN_THRESHOLD
+
+            if price_in_fvg and structure_ok and orderflow_ok:
+                # Stop Loss
+                sl_price = max(c_now.high, fvg_top) + (0.5 * atr_5m)
+                if abs(sl_price - mid) < (0.8 * atr_5m):
+                    sl_price = mid + (0.8 * atr_5m)
+                sl_dist = abs(sl_price - mid)
+
+                # Take Profit
+                tp_price = mid - (sl_dist * expected_r)
+
+                confidence = round(
+                    min(0.72 + kz_confidence_bonus + min(abs(obi_val) / 0.5, 0.15), 0.95),
+                    3,
+                )
+
+                logger.info(
+                    "SmartMoneyFVG SHORT: FVG(%.1f-%.1f) engulf=True mid=%.1f "
+                    "SL=%.1f TP=%.1f R:R=%.1f KZ=%s conf=%.2f",
+                    fvg_bottom, fvg_top, mid, sl_price, tp_price, expected_r,
+                    in_ny_killzone, confidence,
+                )
+                return SignalProposal(
+                    strategy="SmartMoneyFVG",
+                    side=SignalSide.SELL,
+                    order_type=OrderType.ALO,
+                    proposed_price=mid,
+                    stop_loss=round(sl_price, 2),
+                    take_profit=round(tp_price, 2),
+                    regime=regime,
+                    obi=obi_val,
+                    cvd_1m=cvd_1m,
+                    cvd_5m=snap.cvd.cvd_5m,
+                    basis_bps=snap.basis_oi.basis_bps,
+                    oi_change_5m=snap.basis_oi.oi_change_5m_pct,
+                    estimated_hold_minutes=25.0,
+                    expected_r=expected_r,
+                    confidence=confidence,
+                )
+
+        return None
 
 
 # ── Estrategia principal: TrendMomentum v4 (MODO CONSERVADOR) ─────────────────
@@ -369,6 +584,7 @@ class DecisionEngine:
         self._shadow_mode = shadow_mode
         self._regime_classifier = RegimeClassifier()
         self._strategies = [
+            SmartMoneyFVGReversal(),   # v5: primera en evaluar — FVG institucional
             TrendMomentumV4(),
             # AbsorptionMeanReversion(),  # DESACTIVADO - win rate <30%
             # VolatilityBreakout(),       # DESACTIVADO - muchos falsos breakouts
