@@ -71,20 +71,26 @@ def _ema(prices: list[float], period: int) -> float | None:
 
 
 def _rsi(prices: list[float], period: int = 14) -> float | None:
-    """RSI Wilder. Retorna valor 0-100."""
+    """RSI de Wilder real con suavizado exponencial (evita el sesgo de media simple)."""
     if len(prices) < period + 1:
         return None
     deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-    gains = [max(d, 0.0) for d in deltas[-period:]]
-    losses = [max(-d, 0.0) for d in deltas[-period:]]
-    if not any(gains) and not any(losses):
-        return 50.0
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+
+    # Semilla: media simple de los primeros `period` deltas
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    # Suavizado exponencial de Wilder para el resto
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
     if avg_loss == 0:
-        return 100.0
+        return 100.0 if avg_gain > 0 else 50.0
     rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1 + rs))
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def _get_closes(state: MarketState, n: int = 110) -> list[float]:
@@ -171,10 +177,20 @@ class SmartMoneyFVGReversal:
         obi_val = snap.obi.value
         cvd_1m = snap.cvd.cvd_1m
 
-        # ── C.1. Velas recientes ──────────────────────────────────────────────
+        # ── C.1. Velas recientes (anti-repainting) ────────────────────────────
         candles = list(state.candles_1m)
-        c_now = candles[-1]
-        c_prev = candles[-2]
+        # Usar velas confirmadas (cerradas): si la última lleva < 55s desde su apertura
+        # (timestamp_ms), la vela está aún en formación — evaluar sobre candles[:-1].
+        now_ms = time.time() * 1000
+        last_ts_ms = candles[-1].timestamp_ms
+        candle_age_ms = now_ms - last_ts_ms
+        if candle_age_ms < 55_000 and len(candles) > self.MIN_CANDLES:
+            # Vela aún abierta: usar todas menos la última para el patrón envolvente
+            eval_candles = candles[:-1]
+        else:
+            eval_candles = candles
+        c_now = eval_candles[-1]
+        c_prev = eval_candles[-2]
 
         # ── C.2. Estructura previa (swing high/low) ───────────────────────────
         struct_candles = candles[-self.MIN_CANDLES:-self.FVG_SEARCH_WINDOW]
@@ -198,12 +214,20 @@ class SmartMoneyFVGReversal:
             # Bullish FVG: c2.low > c0.high (gap hacia arriba)
             gap_bull = c2.low - c0.high
             if gap_bull >= min_gap:
-                bullish_fvg = (c0.high, c2.low)   # guardar el último encontrado
+                # Verificar que el FVG NO haya sido mitigado por las velas posteriores
+                subsequent = recent[i + 1:]
+                fvg_bottom_b, fvg_top_b = c0.high, c2.low
+                if not subsequent or min(c.low for c in subsequent) > fvg_bottom_b:
+                    bullish_fvg = (fvg_bottom_b, fvg_top_b)
 
             # Bearish FVG: c0.low > c2.high (gap hacia abajo)
             gap_bear = c0.low - c2.high
             if gap_bear >= min_gap:
-                bearish_fvg = (c2.high, c0.low)   # guardar el último encontrado
+                # Verificar que el FVG NO haya sido mitigado
+                subsequent = recent[i + 1:]
+                fvg_bottom_bear, fvg_top_bear = c2.high, c0.low
+                if not subsequent or max(c.high for c in subsequent) < fvg_top_bear:
+                    bearish_fvg = (fvg_bottom_bear, fvg_top_bear)
 
         # ── C.4. Vela Envolvente ──────────────────────────────────────────────
         c_now_body = c_now.close - c_now.open
@@ -238,8 +262,12 @@ class SmartMoneyFVGReversal:
             price_in_fvg = c_now.low <= fvg_top and c_now.close >= fvg_bottom
 
             # Confirmación de estructura: precio respeta el swing high
+            # (precio llegó al nivel O el pullback está por encima del swing low → tendencia alcista sana)
             recent_10 = candles[-10:]
-            structure_ok = max(c.high for c in recent_10) >= swing_high * 0.999
+            structure_ok = (
+                max(c.high for c in recent_10) >= swing_high * 0.999
+                or c_now.low > swing_low
+            )
 
             # Orderflow
             orderflow_ok = cvd_1m > 0 and obi_val > self.OBI_MIN_THRESHOLD
@@ -291,8 +319,12 @@ class SmartMoneyFVGReversal:
             price_in_fvg = c_now.high >= fvg_bottom and c_now.close <= fvg_top
 
             # Confirmación de estructura: precio respeta el swing low
+            # (precio llegó al nivel O el retroceso está por debajo del swing high → tendencia bajista sana)
             recent_10 = candles[-10:]
-            structure_ok = min(c.low for c in recent_10) <= swing_low * 1.001
+            structure_ok = (
+                min(c.low for c in recent_10) <= swing_low * 1.001
+                or c_now.high < swing_high
+            )
 
             # Orderflow
             orderflow_ok = cvd_1m < 0 and obi_val < -self.OBI_MIN_THRESHOLD
@@ -397,6 +429,11 @@ class TrendMomentumV4:
                 "TrendMomentumV4: insuficientes velas %d/%d",
                 len(state.candles_1m), self.MIN_CANDLES,
             )
+            return None
+
+        # FIX: No operar momentum en mercado comprimido
+        if regime == MarketRegime.COMPRESION:
+            logger.debug("TrendMomentumV4: bloqueado por régimen COMPRESION")
             return None
 
         # ── Datos básicos ────────────────────────────────────────────────────
@@ -667,7 +704,8 @@ class DecisionEngine:
                     )
                     continue
 
-                self._last_signal_at = now
+                # NO activar cooldown aquí — lo activa main.py solo si la señal es aprobada
+                # (self._last_signal_at se mueve solo con mark_signal_dispatched())
                 logger.info(
                     "SEÑAL GENERADA: %s %s @ %.2f | conf=%.2f | SL=%.2f | TP=%.2f | régimen=%s | shadow=%s",
                     signal.strategy,
@@ -687,6 +725,14 @@ class DecisionEngine:
                 return signal
 
         return None
+
+    def mark_signal_dispatched(self) -> None:
+        """Activa el cooldown completo de 90 min SOLO cuando la señal fue aprobada y ejecutada."""
+        self._last_signal_at = time.monotonic()
+
+    def mark_signal_rejected(self, retry_delay_s: float = 60.0) -> None:
+        """Si la señal fue vetada, esperar solo retry_delay_s antes de reevaluar (no 90 min)."""
+        self._last_signal_at = time.monotonic() - self._min_signal_gap_s + retry_delay_s
 
     @property
     def current_regime(self) -> MarketRegime:

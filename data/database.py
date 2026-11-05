@@ -362,7 +362,78 @@ async def dump_trades_to_parquet(
         pq.write_table(table, str(out_path), compression="snappy")
         logger.debug("Dumped %d trades to %s", len(trades), out_path)
 
+        # Rotación: conservar solo los últimos 100 archivos parquet (evitar llenar disco Fly.io)
+        try:
+            existing = sorted(PARQUET_DIR.glob(f"{symbol}_trades_*.parquet"), key=lambda p: p.stat().st_mtime)
+            for old_file in existing[:-100]:
+                old_file.unlink(missing_ok=True)
+                logger.debug("Rotated old parquet file: %s", old_file)
+        except Exception:
+            logger.warning("Failed to rotate old parquet files")
+
     except ImportError:
         logger.warning("pyarrow not installed, skipping Parquet dump")
     except Exception:
         logger.exception("Failed to dump trades to Parquet")
+
+
+def dump_trades_to_parquet_sync(
+    trades: list[dict[str, Any]],
+    symbol: str,
+    schema_version: int = 1,
+) -> None:
+    """
+    Versión síncrona de dump_trades_to_parquet para usar con asyncio.to_thread.
+    Evita el anti-patrón de llamar asyncio.run() dentro de run_in_executor.
+    """
+    if not trades:
+        return
+
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        schema = pa.schema([
+            pa.field("timestamp_ms", pa.int64()),
+            pa.field("price", pa.float64()),
+            pa.field("size", pa.float64()),
+            pa.field("side", pa.string()),
+            pa.field("symbol", pa.string()),
+        ])
+
+        table = pa.table(
+            {
+                "timestamp_ms": [t["timestamp_ms"] for t in trades],
+                "price": [t["price"] for t in trades],
+                "size": [t["size"] for t in trades],
+                "side": [t["side"] for t in trades],
+                "symbol": [symbol] * len(trades),
+            },
+            schema=schema,
+        )
+
+        metadata = {
+            b"schema_version": str(schema_version).encode(),
+            b"hl_api_version": b"1",
+            b"created_at": str(time.time()).encode(),
+            b"symbol": symbol.encode(),
+        }
+        table = table.replace_schema_metadata(metadata)
+
+        ts = int(time.time())
+        out_path = PARQUET_DIR / f"{symbol}_trades_{ts}.parquet"
+        pq.write_table(table, str(out_path), compression="snappy")
+        logger.debug("Dumped %d trades to %s (sync)", len(trades), out_path)
+
+        # Rotación: conservar solo los últimos 100 archivos
+        try:
+            existing = sorted(PARQUET_DIR.glob(f"{symbol}_trades_*.parquet"), key=lambda p: p.stat().st_mtime)
+            for old_file in existing[:-100]:
+                old_file.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("Failed to rotate old parquet files (sync)")
+
+    except ImportError:
+        logger.warning("pyarrow not installed, skipping Parquet dump (sync)")
+    except Exception:
+        logger.exception("Failed to dump trades to Parquet (sync)")

@@ -102,12 +102,14 @@ class ExternalSnapshot:
 class ExternalSignalsFetcher:
     """
     Tarea de fondo que actualiza ExternalSnapshot cada UPDATE_INTERVAL_S.
-    Usa httpx.AsyncClient para no bloquear el event loop.
+    Usa httpx.AsyncClient con fallback anti-bloqueo HTTP 451 (EE. UU. / Fly.io iad).
     """
 
     UPDATE_INTERVAL_S = 900.0   # 15 minutos
     FNG_URL     = "https://api.alternative.me/fng/?limit=1"
     BINANCE_URL = "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT"
+    BYBIT_URL   = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"
+    HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 
     def __init__(self) -> None:
         self.snapshot = ExternalSnapshot()
@@ -119,7 +121,6 @@ class ExternalSignalsFetcher:
     async def run(self) -> None:
         """Bucle infinito — actualiza snapshot cada 15 minutos."""
         logger.info("ExternalSignalsFetcher started (interval=%ds)", self.UPDATE_INTERVAL_S)
-        # Primera actualización inmediata al arrancar
         await self._update()
         while self._running:
             await asyncio.sleep(self.UPDATE_INTERVAL_S)
@@ -128,15 +129,18 @@ class ExternalSignalsFetcher:
     async def _update(self) -> None:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
-                await asyncio.gather(
+                results = await asyncio.gather(
                     self._fetch_fng(client),
-                    self._fetch_binance_funding(client),
+                    self._fetch_funding_with_fallback(client),
+                    return_exceptions=True,
                 )
+                for idx, res in enumerate(results):
+                    if isinstance(res, Exception):
+                        source = "Fear&Greed" if idx == 0 else "ExternalFunding"
+                        logger.warning("Partial failure updating %s: %s", source, res)
+
             self._recalculate_flags()
-            logger.info(
-                "External signals updated: %s",
-                self.snapshot.summary(),
-            )
+            logger.info("External signals updated: %s", self.snapshot.summary())
         except Exception:
             logger.exception("Failed to update external signals — keeping last values")
 
@@ -148,14 +152,54 @@ class ExternalSignalsFetcher:
         self.snapshot.fng_label = data["value_classification"]
         self.snapshot.fng_updated_at = time.time()
 
-    async def _fetch_binance_funding(self, client: httpx.AsyncClient) -> None:
-        resp = await client.get(self.BINANCE_URL)
+    async def _fetch_funding_with_fallback(self, client: httpx.AsyncClient) -> None:
+        """
+        Intenta Binance Futures; si falla por geobloqueo (HTTP 451/403 en Fly.io iad),
+        usa Bybit Linear Perps y como último recurso Hyperliquid Mainnet info.
+        """
+        # 1. Intentar Binance
+        try:
+            resp = await client.get(self.BINANCE_URL)
+            if resp.status_code not in (451, 403):
+                resp.raise_for_status()
+                data = resp.json()
+                funding_8h = float(data["lastFundingRate"]) * 100
+                self.snapshot.binance_funding_8h_pct = funding_8h
+                self.snapshot.binance_funding_annual_pct = funding_8h * 3 * 365
+                self.snapshot.binance_mark_price = float(data["markPrice"])
+                self.snapshot.binance_updated_at = time.time()
+                return
+        except Exception as e:
+            logger.debug("Binance funding unavailable (%s), trying fallback...", e)
+
+        # 2. Fallback: Bybit V5 (accesible globalmente sin bloqueo 451)
+        try:
+            resp = await client.get(self.BYBIT_URL)
+            resp.raise_for_status()
+            items = resp.json().get("result", {}).get("list", [])
+            if items:
+                item = items[0]
+                funding_8h = float(item.get("fundingRate", 0.0)) * 100
+                self.snapshot.binance_funding_8h_pct = funding_8h
+                self.snapshot.binance_funding_annual_pct = funding_8h * 3 * 365
+                self.snapshot.binance_mark_price = float(item.get("markPrice", 0.0))
+                self.snapshot.binance_updated_at = time.time()
+                return
+        except Exception as e:
+            logger.debug("Bybit funding fallback failed (%s), trying Hyperliquid...", e)
+
+        # 3. Fallback nativo: Hyperliquid Mainnet
+        resp = await client.post(self.HL_INFO_URL, json={"type": "metaAndAssetCtxs"})
         resp.raise_for_status()
-        data = resp.json()
-        funding_8h = float(data["lastFundingRate"]) * 100  # a porcentaje
+        meta, ctxs = resp.json()
+        btc_idx = next(i for i, a in enumerate(meta["universe"]) if a["name"] == "BTC")
+        ctx = ctxs[btc_idx]
+        # HL funding es por 1h -> multiplicar por 8 para equivalente 8h
+        funding_1h_pct = float(ctx.get("funding", 0.0)) * 100
+        funding_8h = funding_1h_pct * 8.0
         self.snapshot.binance_funding_8h_pct = funding_8h
-        self.snapshot.binance_funding_annual_pct = funding_8h * 3 * 365
-        self.snapshot.binance_mark_price = float(data["markPrice"])
+        self.snapshot.binance_funding_annual_pct = funding_1h_pct * 8760
+        self.snapshot.binance_mark_price = float(ctx.get("markPx", 0.0))
         self.snapshot.binance_updated_at = time.time()
 
     def _recalculate_flags(self) -> None:

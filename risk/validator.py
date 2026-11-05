@@ -109,7 +109,7 @@ class RiskValidator:
 
         # 3. Límites de cuenta
         risk_state = await self._load_risk_state(state)
-        self._check_account_limits(risk_state, state)
+        await self._check_account_limits(risk_state, state)
 
         # 4. Posición única
         self._check_max_position(state)
@@ -186,6 +186,39 @@ class RiskValidator:
         self._kill_switch_active = True
         logger.critical("KILL SWITCH ACTIVATED: %s", reason)
 
+    def apply_size_multiplier(self, approved: ApprovedOrder, multiplier: float) -> ApprovedOrder:
+        """
+        Re-escala el tamaño aprobado por un multiplicador externo (ej: F&G size_multiplier).
+        Re-redondea a sz_decimals y verifica notional mínimo.
+        Retorna un nuevo ApprovedOrder inmutable con el tamaño ajustado.
+        """
+        if multiplier >= 1.0:
+            return approved
+        factor = 10 ** self._sz_decimals
+        new_size = math.floor(approved.approved_size * multiplier * factor) / factor
+        if new_size <= 0:
+            new_size = 1 / factor  # mínimo absoluto
+        notional = new_size * approved.approved_price
+        if notional < self._min_notional_usd:
+            logger.info(
+                "apply_size_multiplier: tamaño reducido %sx → notional $%.2f < mínimo $%.2f; manteniendo original.",
+                multiplier, notional, self._min_notional_usd,
+            )
+            return approved
+        logger.info(
+            "apply_size_multiplier: %.5f → %.5f BTC (x%.2f, notional $%.2f)",
+            approved.approved_size, new_size, multiplier, notional,
+        )
+        return ApprovedOrder(
+            signal=approved.signal,
+            approved_size=new_size,
+            approved_price=approved.approved_price,
+            approved_stop_loss=approved.approved_stop_loss,
+            approved_take_profit=approved.approved_take_profit,
+            risk_amount_usd=approved.risk_amount_usd,
+            effective_leverage=approved.effective_leverage * multiplier,
+        )
+
     # ── Verificaciones ─────────────────────────────────────────────────────────
 
     def _check_kill_switch(self) -> None:
@@ -254,7 +287,7 @@ class RiskValidator:
             kill_switch=bool(row["kill_switch"]),
         )
 
-    def _check_account_limits(self, risk_state: RiskState, state: MarketState) -> None:
+    async def _check_account_limits(self, risk_state: RiskState, state: MarketState) -> None:
         # Kill switch permanente en BD (sobrevive reinicios)
         if risk_state.kill_switch:
             self.activate_kill_switch("Permanent kill switch from DB (max drawdown exceeded)")
@@ -265,10 +298,10 @@ class RiskValidator:
             remaining_h = (risk_state.paused_until - time.time()) / 3600
             raise VetoException(
                 VetoReason.RISK_DAILY_LIMIT,
-                f"Bot paused for {remaining_h:.1f}h more (daily loss limit hit)",
+                f"Bot paused for {remaining_h:.1f}h more (daily loss limit or manual pause)",
             )
 
-        # Pérdida diaria: pérdida realizada + no realizada < 3% del equity inicial
+        # Pérdida diaria: pérdida realizada + no realizada < límite diario del equity inicial
         total_pnl_pct = (
             (risk_state.realized_pnl + risk_state.unrealized_pnl)
             / risk_state.equity_open
@@ -284,9 +317,12 @@ class RiskValidator:
                 total_pnl_pct,
                 -daily_limit_pct,
             )
-            # Pausa automática de 24 horas
             pause_until = time.time() + 86_400
-            # (En producción, actualizar BD aquí)
+            await self._db.execute(
+                "UPDATE daily_risk SET paused_until = ?, updated_at = unixepoch('now', 'subsec') WHERE date_utc = ?",
+                (pause_until, risk_state.date_utc),
+            )
+            await self._db.commit()
             raise VetoException(
                 VetoReason.RISK_DAILY_LIMIT,
                 f"Daily loss {total_pnl_pct:.2f}% exceeds -{daily_limit_pct:.1f}% limit",
@@ -303,6 +339,11 @@ class RiskValidator:
                 self.activate_kill_switch(
                     f"Max drawdown {drawdown_pct:.2f}% > {max_dd_pct:.1f}%"
                 )
+                await self._db.execute(
+                    "UPDATE daily_risk SET kill_switch = 1, updated_at = unixepoch('now', 'subsec') WHERE date_utc = ?",
+                    (risk_state.date_utc,),
+                )
+                await self._db.commit()
                 raise VetoException(
                     VetoReason.RISK_DRAWDOWN,
                     f"Drawdown {drawdown_pct:.2f}% exceeds {max_dd_pct:.1f}% — PERMANENT HALT",

@@ -82,6 +82,9 @@ class HyperliquidExecutor:
         self._protect_lock = asyncio.Lock()  # FIX: evita colocar SL/TP en paralelo
                                               # si on_fill() y ensure_protected()
                                               # (reconciliador) se disparan a la vez
+        self._filled_size: float = 0.0       # Acumulador de partial fills
+        self._moved_to_be: bool = False       # Flag de break-even ya aplicado
+        self._entry_time: float = 0.0         # Tiempo de apertura de posición
 
         # Monitorear archivo STOP_BOT.flag
         asyncio.get_event_loop().create_task(self._monitor_kill_flag())
@@ -152,23 +155,34 @@ class HyperliquidExecutor:
         """
         Orden Add Liquidity Only (Post-Only / Maker).
         Si no se llena en ALO_TIMEOUT_S, se cancela.
+        Ancla el precio al l2_book actual para garantizar Post-Only.
         """
         signal = approved.signal
         is_buy = signal.side == SignalSide.BUY
 
-        if self._symbol == "BTC":
-            order_px = float(math.floor(approved.approved_price) if is_buy else math.ceil(approved.approved_price))
+        # FIX precio ALO: anclar al l2_book para nunca cruzar como Taker
+        from data.state import market_state
+        best_bid = market_state.l2_book.bids[0].price if market_state.l2_book and market_state.l2_book.bids else approved.approved_price
+        best_ask = market_state.l2_book.asks[0].price if market_state.l2_book and market_state.l2_book.asks else approved.approved_price
+
+        if is_buy:
+            # Post-Only BUY: nunca >= best_ask
+            raw_px = min(approved.approved_price, best_bid, best_ask - (1.0 if self._symbol == "BTC" else 0.01))
+            order_px = float(math.floor(raw_px)) if self._symbol == "BTC" else round(raw_px, 2)
         else:
-            order_px = round(approved.approved_price, 2)
+            # Post-Only SELL: nunca <= best_bid
+            raw_px = max(approved.approved_price, best_ask, best_bid + (1.0 if self._symbol == "BTC" else 0.01))
+            order_px = float(math.ceil(raw_px)) if self._symbol == "BTC" else round(raw_px, 2)
 
         try:
-            result = self._exchange.order(
+            result = await asyncio.to_thread(
+                self._exchange.order,
                 self._symbol,
                 is_buy,
                 approved.approved_size,
                 order_px,
                 {"limit": {"tif": "Alo"}},
-                cloid=cloid,
+                cloid,
             )
             logger.info("ALO order result from exchange: %s (px=%.1f)", result, order_px)
             if isinstance(result, dict) and result.get("status") == "err":
@@ -261,7 +275,15 @@ class HyperliquidExecutor:
         Inicia la colocación automática de Stop Loss y Take Profit.
         """
         if self._sm.state in (ExecutorState.OPEN_PROTECTED, ExecutorState.OPEN_UNPROTECTED):
-            logger.debug("on_fill ignored: already in state %s", self._sm.state.value)
+            # Partial fill adicional: acumular tamaño y re-proteger
+            self._filled_size = getattr(self, "_filled_size", 0.0) + fill_size
+            logger.warning(
+                "Additional partial fill received (+%.5f BTC, total=%.5f BTC). Updating TP/SL...",
+                fill_size, self._filled_size,
+            )
+            if self._active_order:
+                signed = self._filled_size if self._active_order.signal.side == SignalSide.BUY else -self._filled_size
+                await self.ensure_protected(fill_price, signed)
             return
 
         logger.info(
@@ -273,6 +295,9 @@ class HyperliquidExecutor:
         )
 
         self._fill_event.set()
+        self._filled_size = fill_size
+        self._entry_time = time.monotonic()
+        self._moved_to_be = False
 
         # FIX #A: el fill puede llegar cuando el estado YA NO es ENTRY_PENDING
         # (ej.: el timeout de 15s de la ALO ya hizo ENTRY_PENDING -> FLAT justo
@@ -493,7 +518,7 @@ class HyperliquidExecutor:
         """
         logger.info("Position closed (%s). Cleaning up residual orders...", reason)
         try:
-            self._exchange.cancel_all(self._symbol)
+            await asyncio.to_thread(self._exchange.cancel_all, self._symbol)
             logger.info("Residual orders cancelled for %s", self._symbol)
         except Exception:
             logger.exception("Failed to cancel residual orders on position close")
@@ -518,7 +543,7 @@ class HyperliquidExecutor:
         try:
             await self._sm.transition(ExecutorState.CLOSING, f"Emergency: {reason}")
 
-            result = self._exchange.market_close(self._symbol)
+            result = await asyncio.to_thread(self._exchange.market_close, self._symbol)
             logger.critical("Emergency close result: %s", result)
 
             await self._sm.transition(ExecutorState.FLAT, "Emergency close complete")
@@ -541,12 +566,12 @@ class HyperliquidExecutor:
 
         try:
             # Cancelar todas las órdenes abiertas
-            self._exchange.cancel_all(self._symbol)
+            await asyncio.to_thread(self._exchange.cancel_all, self._symbol)
             logger.info("All orders cancelled")
 
             # Cerrar posición si existe
             try:
-                self._exchange.market_close(self._symbol)
+                await asyncio.to_thread(self._exchange.market_close, self._symbol)
                 logger.info("Position closed at market")
             except Exception:
                 logger.exception("Failed to close position during kill switch")
@@ -569,6 +594,93 @@ class HyperliquidExecutor:
         """Máximo 1 modificación cada 5 segundos (rate limit de Hyperliquid)."""
         return (time.monotonic() - self._last_modify_at) >= self.ORDER_MODIFY_COOLDOWN_S
 
+    # ── Gestión activa: Break-Even y Time-Stop ────────────────────────────────
+
+    async def manage_open_position(self, state: Any) -> None:
+        """
+        Llamar cada 5s desde main.py mientras hay posición abierta.
+        1. Break-Even automático en +1.0R: mueve SL a precio de entrada.
+        2. Time-Stop: cierra si la posición lleva > 2.5x estimated_hold_minutes
+           y el PnL flotante está estancado (entre -0.3R y +0.5R).
+        """
+        if self._sm.state != ExecutorState.OPEN_PROTECTED:
+            return
+        if self._active_order is None or self._kill_switch_active:
+            return
+
+        signal = self._active_order.signal
+        entry_price = state.account.position_entry_price or self._active_order.approved_price
+        mark_price = state.asset_ctx.mark_price if state.asset_ctx else 0.0
+        if mark_price <= 0 or entry_price <= 0:
+            return
+
+        initial_sl = self._active_order.approved_stop_loss
+        sl_dist = abs(entry_price - initial_sl)
+        if sl_dist <= 0:
+            return
+
+        is_long = signal.side == SignalSide.BUY
+        pnl_r = ((mark_price - entry_price) / sl_dist) if is_long else ((entry_price - mark_price) / sl_dist)
+
+        # ── Break-Even en +1.0R ───────────────────────────────────────────────
+        if not self._moved_to_be and pnl_r >= 1.0 and self._can_modify_order():
+            be_price = entry_price * 1.0005 if is_long else entry_price * 0.9995
+            be_price = float(round(be_price)) if self._symbol == "BTC" else round(be_price, 2)
+            logger.info(
+                "Break-Even activado: posición en +%.1fR. Moviendo SL a %.2f (entry=%.2f)",
+                pnl_r, be_price, entry_price,
+            )
+            try:
+                # Cancelar SL anterior y colocar nuevo SL en break-even
+                if self._active_sl_oid:
+                    await asyncio.to_thread(
+                        self._exchange.cancel, self._symbol, [{"a": 0, "o": self._active_sl_oid}]
+                    )
+                sl_side = not is_long
+                sl_res = await asyncio.to_thread(
+                    self._exchange.order,
+                    self._symbol,
+                    sl_side,
+                    self._filled_size,
+                    be_price,
+                    {"trigger": {"isMarket": True, "triggerPx": be_price, "tpsl": "sl"}},
+                    True,  # reduce_only
+                )
+                self._active_sl_oid = None
+                statuses = sl_res.get("response", {}).get("data", {}).get("statuses", [{}]) if isinstance(sl_res, dict) else [{}]
+                if statuses and isinstance(statuses[0], dict):
+                    self._active_sl_oid = statuses[0].get("resting", {}).get("oid")
+                self._moved_to_be = True
+                self._last_modify_at = time.monotonic()
+                if self._alerter:
+                    await self._alerter.send(
+                        f"🔒 *BREAK-EVEN ACTIVADO*\n"
+                        f"Posición en `+{pnl_r:.1f}R`\n"
+                        f"SL movido a entrada: `${be_price:,.2f}`\n"
+                        f"Riesgo = 0 desde ahora.",
+                        alert_type="INFO",
+                    )
+            except Exception:
+                logger.exception("Error aplicando break-even")
+
+        # ── Time-Stop ─────────────────────────────────────────────────────────
+        hold_minutes = signal.estimated_hold_minutes or 25.0
+        elapsed_minutes = (time.monotonic() - self._entry_time) / 60.0
+        if elapsed_minutes >= 2.5 * hold_minutes and -0.3 <= pnl_r <= 0.5:
+            logger.warning(
+                "Time-Stop activado: %.0f min elapsed (> 2.5x %.0f min hold), PnL=%.2fR. Cerrando.",
+                elapsed_minutes, hold_minutes, pnl_r,
+            )
+            if self._alerter:
+                await self._alerter.send(
+                    f"⏱ *TIME-STOP EJECUTADO*\n"
+                    f"Posición abierta `{elapsed_minutes:.0f}min` (límite: `{2.5*hold_minutes:.0f}min`)\n"
+                    f"PnL flotante: `{pnl_r:+.2f}R` — operación estancada.\n"
+                    f"Cerrando a mercado...",
+                    alert_type="WARNING",
+                )
+            await self._emergency_close(self._filled_size, "Time-Stop: posición estancada")
+
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     async def _wait_for_fill(self, cloid: str) -> None:
@@ -581,7 +693,7 @@ class HyperliquidExecutor:
     async def _cancel_order(self, cloid: str) -> None:
         """Cancela una orden por cloid."""
         try:
-            result = self._exchange.cancel_by_cloid(self._symbol, cloid)
+            result = await asyncio.to_thread(self._exchange.cancel_by_cloid, self._symbol, cloid)
             logger.info("Order cancelled (cloid=%s): %s", cloid, result)
         except Exception:
             logger.exception("Failed to cancel order cloid=%s", cloid)

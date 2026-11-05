@@ -23,7 +23,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from config.settings import get_settings
-from data.database import BotProcessState, DBEvent, DatabaseWorker, dump_trades_to_parquet, set_bot_state
+from data.database import BotProcessState, DBEvent, DatabaseWorker, dump_trades_to_parquet, dump_trades_to_parquet_sync, set_bot_state
 from data.state import AssetContext, Candle, L2Book, L2Level, MarketState, Trade, market_state
 
 logger = logging.getLogger(__name__)
@@ -234,12 +234,32 @@ class HyperliquidIngestor:
             volume=float(data.get("v", 0)),
             interval=data.get("i", "1m"),
         )
-        # FIX #2: Deduplicar velas del mismo minuto (WS env\u00eda muchos updates por minuto)
+        # FIX #2: Deduplicar velas del mismo minuto (WS envía muchos updates por minuto)
         if self._state.candles_1m and self._state.candles_1m[-1].timestamp_ms == candle.timestamp_ms:
             self._state.candles_1m[-1] = candle   # reemplazar en lugar de duplicar
         else:
             self._state.candles_1m.append(candle)
 
+        # FIX candles_5m: Agregar/actualizar vela de 5m correspondiente (bucket de 300_000 ms)
+        bucket_5m_ts = (candle.timestamp_ms // 300_000) * 300_000
+        candles_in_bucket = [
+            c for c in self._state.candles_1m
+            if (c.timestamp_ms // 300_000) * 300_000 == bucket_5m_ts
+        ]
+        if candles_in_bucket:
+            c5 = Candle(
+                timestamp_ms=bucket_5m_ts,
+                open=candles_in_bucket[0].open,
+                high=max(c.high for c in candles_in_bucket),
+                low=min(c.low for c in candles_in_bucket),
+                close=candles_in_bucket[-1].close,
+                volume=sum(c.volume for c in candles_in_bucket),
+                interval="5m",
+            )
+            if self._state.candles_5m and self._state.candles_5m[-1].timestamp_ms == bucket_5m_ts:
+                self._state.candles_5m[-1] = c5
+            else:
+                self._state.candles_5m.append(c5)
 
         # Persistir en BD via Cola (Cold Path)
         self._db_worker._queue.put_nowait(DBEvent(
@@ -400,10 +420,7 @@ class HyperliquidIngestor:
             })
             spot_data = spot_resp.json() if spot_resp.status_code == 200 else {}
 
-        # ── Equity (Unified Account) ──────────────────────────────────────────
-        # En Hyperliquid Unified Account, el balance total de la cuenta es el USDC de Spot.
-        # Cuando se abre una posición, parte del balance se asigna temporalmente a perps
-        # (marginSummary.accountValue), por lo que leer solo perps causaba una falsa caída del 60%.
+        # ── Equity (Soporte correcto para Perps Account y Unified Account) ────
         spot_balances = spot_data.get("balances", []) if isinstance(spot_data, dict) else []
         spot_usdc = next(
             (float(b["total"]) for b in spot_balances if b.get("coin") == "USDC"),
@@ -412,18 +429,12 @@ class HyperliquidIngestor:
         perp_account_val = float(
             state_data.get("marginSummary", {}).get("accountValue", 0)
         )
-        if spot_usdc > 0:
-            equity = spot_usdc
-        else:
-            equity = perp_account_val
+        cross_margin_val = float(
+            state_data.get("crossMarginSummary", {}).get("accountValue", 0)
+        )
+        effective_perp_val = max(perp_account_val, cross_margin_val)
 
-        withdrawable = float(state_data.get("withdrawable", equity))
-
-        # Actualizar estado en memoria
-        self._state.account.equity = equity
-        self._state.account.available_margin = withdrawable
-
-        # ── Posición ───────────────────────────────────────────────────────────
+        # ── Posición (extraer para conocer unreal_pnl y margin_used) ─────────
         positions = state_data.get("assetPositions", [])
         real_pos = 0.0
         entry_px = 0.0
@@ -438,6 +449,19 @@ class HyperliquidIngestor:
                 margin_used = float(p.get("marginUsed") or 0.0)
                 break
 
+        # Si spot_usdc domina (Unified Account donde el colateral vive en Spot),
+        # el equity total es spot_usdc + unreal_pnl.
+        # Si el colateral vive en Perps y Spot solo tiene polvo residual, usamos effective_perp_val.
+        if spot_usdc > effective_perp_val:
+            equity = spot_usdc + unreal_pnl
+        else:
+            equity = effective_perp_val + spot_usdc
+
+        withdrawable = float(state_data.get("withdrawable", 0.0)) or max(0.0, equity - margin_used)
+
+        # Actualizar estado en memoria
+        self._state.account.equity = equity
+        self._state.account.available_margin = withdrawable
         self._state.account.unrealized_pnl = unreal_pnl
         self._state.account.margin_used = margin_used
 
@@ -578,20 +602,19 @@ class HyperliquidIngestor:
     # ── Volcado Parquet ────────────────────────────────────────────────────────
 
     async def _parquet_dump_loop(self) -> None:
-        """Vuelca el buffer de trades a Parquet cada 5 minutos."""
+        """Vuelca el buffer de trades a Parquet cada 5 minutos usando asyncio.to_thread."""
         while self._running:
             await asyncio.sleep(self.PARQUET_DUMP_INTERVAL_S)
             if self._trades_buffer:
                 buffer_copy = self._trades_buffer.copy()
                 self._trades_buffer.clear()
-                # Ejecutar en thread pool para no bloquear el loop
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda: asyncio.run(
-                        dump_trades_to_parquet(buffer_copy, self._symbol)
-                    ),
-                )
+                try:
+                    # asyncio.to_thread evita el anti-patrón asyncio.run() dentro de run_in_executor
+                    await asyncio.to_thread(
+                        dump_trades_to_parquet_sync, buffer_copy, self._symbol
+                    )
+                except Exception:
+                    logger.exception("Failed to dump trades to parquet")
 
     def stop(self) -> None:
         self._running = False

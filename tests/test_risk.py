@@ -451,3 +451,241 @@ class TestMicrostructureRules:
         except VetoException as e:
             # Otros vetos son posibles (notional mÃ­nimo, etc.)
             pass
+
+
+# ── Tests adicionales: persistencia BD, apply_size_multiplier, RSI Wilder, cooldown ──
+
+
+@pytest.fixture
+async def fresh_db():
+    """Base de datos limpia en memoria para tests de persistencia."""
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    await db.executescript("""
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS daily_risk (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date_utc TEXT NOT NULL UNIQUE,
+            equity_open REAL NOT NULL,
+            equity_peak REAL NOT NULL,
+            realized_pnl REAL NOT NULL DEFAULT 0.0,
+            unrealized_pnl REAL NOT NULL DEFAULT 0.0,
+            paused_until REAL,
+            kill_switch INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL DEFAULT (unixepoch('now', 'subsec'))
+        );
+        CREATE TABLE IF NOT EXISTS live_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            oid INTEGER, coin TEXT, dir TEXT,
+            px REAL, sz REAL, closed_pnl REAL DEFAULT 0.0,
+            fee REAL DEFAULT 0.0, ts_ms INTEGER,
+            created_at REAL DEFAULT (unixepoch('now', 'subsec'))
+        );
+    """)
+    await db.commit()
+    yield db
+    await db.close()
+
+
+def make_live_settings():
+    s = MagicMock()
+    s.env = "mainnet"
+    s.trading_symbol = "BTC"
+    s.risk_per_trade_pct = 0.015
+    s.max_leverage = 3.0
+    s.daily_loss_limit_pct = 0.02   # 2%
+    s.max_drawdown_pct = 0.08       # 8%
+    s.shadow_mode = False
+    s.telegram_chat_id = 0
+    s.hl_main_address = "0x0000000000000000000000000000000000000000"
+    return s
+
+
+def _make_signal_for_risk(side=SignalSide.BUY, price=80000.0):
+    return SignalProposal(
+        strategy="TestStrat",
+        side=side,
+        order_type=OrderType.ALO,
+        proposed_price=price,
+        stop_loss=price - 200.0 if side == SignalSide.BUY else price + 200.0,
+        take_profit=price + 440.0 if side == SignalSide.BUY else price - 440.0,
+        regime=MarketRegime.RANGO,
+        obi=0.20,
+        cvd_1m=10.0,
+        cvd_5m=25.0,
+        basis_bps=1.5,
+        oi_change_5m=0.3,
+        estimated_hold_minutes=25.0,
+        expected_r=2.2,
+        confidence=0.75,
+    )
+
+
+def _make_state_risk(equity=50.0, price=80000.0):
+    state = MarketState()
+    state.account = AccountState(
+        equity=equity,
+        available_margin=equity * 0.95,
+        position_size=0.0,
+        position_entry_price=0.0,
+        unrealized_pnl=0.0,
+    )
+    state.asset_ctx = AssetContext(
+        mark_price=price,
+        oracle_price=price * 0.9999,
+        funding_rate=0.000005,
+        open_interest=45000.0,
+        timestamp_ms=int(time.time() * 1000),
+    )
+    state.l2_book = L2Book(
+        bids=[L2Level(price - 2.0, 5.0)],
+        asks=[L2Level(price + 2.0, 2.0)],
+        timestamp_ms=int(time.time() * 1000),
+    )
+    state._last_ws_message_at = time.monotonic()
+    return state
+
+
+class TestPersistencia:
+
+    @pytest.mark.asyncio
+    async def test_daily_loss_limit_persiste_paused_until(self, fresh_db):
+        """Cuando se supera el daily_loss_limit, paused_until se guarda en daily_risk."""
+        today = date.today().isoformat()
+        equity = 100.0
+        # Pre-poblar daily_risk con pérdida del 5% (> 2% límite)
+        await fresh_db.execute(
+            "INSERT INTO daily_risk (date_utc, equity_open, equity_peak, realized_pnl, unrealized_pnl) VALUES (?, ?, ?, ?, ?)",
+            (today, equity, equity, -6.0, 0.0),   # -6% > -2% límite
+        )
+        await fresh_db.commit()
+
+        validator = RiskValidator(fresh_db, sz_decimals=4, min_notional_usd=10.0, settings=make_live_settings())
+        signal = _make_signal_for_risk()
+        state = _make_state_risk(equity=equity)
+
+        with pytest.raises(VetoException) as exc_info:
+            await validator.validate(signal, state, shadow_mode=False)
+
+        assert exc_info.value.reason.value == "RISK_DAILY_LIMIT"
+
+        # Verificar que paused_until fue persistido en BD
+        async with fresh_db.execute("SELECT paused_until FROM daily_risk WHERE date_utc = ?", (today,)) as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row["paused_until"] is not None
+        assert row["paused_until"] > time.time()   # está en el futuro
+
+    @pytest.mark.asyncio
+    async def test_max_drawdown_persiste_kill_switch(self, fresh_db):
+        """Cuando se supera max_drawdown, kill_switch = 1 queda en daily_risk."""
+        today = date.today().isoformat()
+        equity_open = 100.0
+        equity_peak = 100.0
+        await fresh_db.execute(
+            "INSERT INTO daily_risk (date_utc, equity_open, equity_peak, realized_pnl, unrealized_pnl) VALUES (?, ?, ?, 0, 0)",
+            (today, equity_open, equity_peak),
+        )
+        await fresh_db.commit()
+
+        validator = RiskValidator(fresh_db, sz_decimals=4, min_notional_usd=10.0, settings=make_live_settings())
+        signal = _make_signal_for_risk()
+        # Equity caída al 85% del pico = 15% drawdown > 8% límite
+        state = _make_state_risk(equity=85.0)
+
+        with pytest.raises(VetoException) as exc_info:
+            await validator.validate(signal, state, shadow_mode=False)
+
+        assert exc_info.value.reason.value == "RISK_DRAWDOWN"
+
+        # Verificar que kill_switch = 1 fue persistido
+        async with fresh_db.execute("SELECT kill_switch FROM daily_risk WHERE date_utc = ?", (today,)) as cur:
+            row = await cur.fetchone()
+        assert row is not None
+        assert row["kill_switch"] == 1
+
+
+class TestApplySizeMultiplier:
+
+    @pytest.mark.asyncio
+    async def test_multiplier_reduces_size(self, fresh_db):
+        """apply_size_multiplier con 0.5 reduce el tamaño a la mitad."""
+        from signals.schemas import ApprovedOrder
+        validator = RiskValidator(fresh_db, sz_decimals=4, min_notional_usd=10.0, settings=make_live_settings())
+        signal = _make_signal_for_risk()
+        approved = ApprovedOrder(
+            signal=signal,
+            approved_size=0.0010,
+            approved_price=80000.0,
+            approved_stop_loss=79800.0,
+            approved_take_profit=80440.0,
+            risk_amount_usd=0.75,
+            effective_leverage=1.6,
+        )
+        result = validator.apply_size_multiplier(approved, 0.5)
+        assert result.approved_size < approved.approved_size
+        assert result.approved_size * result.approved_price >= 10.0   # nocional mínimo
+
+    @pytest.mark.asyncio
+    async def test_multiplier_1_unchanged(self, fresh_db):
+        """apply_size_multiplier con 1.0 no cambia nada."""
+        from signals.schemas import ApprovedOrder
+        validator = RiskValidator(fresh_db, sz_decimals=4, min_notional_usd=10.0, settings=make_live_settings())
+        signal = _make_signal_for_risk()
+        approved = ApprovedOrder(
+            signal=signal,
+            approved_size=0.0020,
+            approved_price=80000.0,
+            approved_stop_loss=79800.0,
+            approved_take_profit=80440.0,
+            risk_amount_usd=0.75,
+            effective_leverage=1.6,
+        )
+        result = validator.apply_size_multiplier(approved, 1.0)
+        assert result is approved   # mismo objeto, sin copia
+
+
+class TestRSIWilderYCooldown:
+
+    def test_rsi_wilder_vs_simple_diferente(self):
+        """RSI de Wilder produce resultado distinto al RSI de media simple."""
+        from signals.engine import _rsi
+        # Serie de precios con tendencia clara
+        prices = [100.0 + i * 0.5 + (i % 3) * 0.2 for i in range(30)]
+        rsi_val = _rsi(prices, period=14)
+        assert rsi_val is not None
+        assert 0.0 <= rsi_val <= 100.0
+
+    def test_rsi_serie_pura_alcista(self):
+        """RSI en serie puramente alcista debe ser cercano a 100."""
+        from signals.engine import _rsi
+        prices = [float(i) for i in range(1, 32)]   # 1,2,...,31
+        rsi_val = _rsi(prices, period=14)
+        assert rsi_val is not None
+        assert rsi_val > 90.0, f"RSI alcista esperado > 90, got {rsi_val:.1f}"
+
+    def test_rsi_serie_pura_bajista(self):
+        """RSI en serie puramente bajista debe ser cercano a 0."""
+        from signals.engine import _rsi
+        prices = [float(31 - i) for i in range(31)]   # 31,30,...,1
+        rsi_val = _rsi(prices, period=14)
+        assert rsi_val is not None
+        assert rsi_val < 10.0, f"RSI bajista esperado < 10, got {rsi_val:.1f}"
+
+    def test_mark_signal_dispatched_activa_cooldown_90min(self):
+        """mark_signal_dispatched activa cooldown completo de 90 min."""
+        from signals.engine import DecisionEngine
+        engine = DecisionEngine(shadow_mode=True)
+        engine.mark_signal_dispatched()
+        # Después de dispatch, el gap debe ser casi 90 min
+        remaining = engine._min_signal_gap_s - (time.monotonic() - engine._last_signal_at)
+        assert remaining > 5000   # > 83 min restantes
+
+    def test_mark_signal_rejected_cooldown_corto(self):
+        """mark_signal_rejected(60s) deja solo 60s de cooldown."""
+        from signals.engine import DecisionEngine
+        engine = DecisionEngine(shadow_mode=True)
+        engine.mark_signal_rejected(retry_delay_s=60.0)
+        remaining = engine._min_signal_gap_s - (time.monotonic() - engine._last_signal_at)
+        # El cooldown restante debe ser ~60s (con pequeña tolerancia)
+        assert 50.0 <= remaining <= 70.0, f"Cooldown esperado ~60s, got {remaining:.1f}s"

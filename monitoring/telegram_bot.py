@@ -182,15 +182,16 @@ class TelegramCommandHandler:
         if self._db:
             try:
                 async with self._db.execute(
-                    "SELECT agreed_side, agreement_ratio, meta_confidence, created_at "
+                    "SELECT strategy, side, regime, proposed_price, vetoed, veto_reason "
                     "FROM decisions ORDER BY id DESC LIMIT 1"
                 ) as cur:
                     row = await cur.fetchone()
                     if row:
-                        side, ratio, conf, _ = row
-                        last_decision_str = f"{side} (Consenso: {ratio*100:.0f}%, Conf: {conf*100:.0f}%)"
+                        strat, side, reg, px, vetoed, v_reason = row
+                        status_lbl = f"VETADA ({v_reason})" if vetoed else "APROBADA"
+                        last_decision_str = f"{strat} {side} @ ${px:,.1f} [{reg}] → {status_lbl}"
             except Exception:
-                pass
+                logger.debug("Error reading last decision in cmd_status", exc_info=True)
 
         msg = (
             f"📊 *Bot Status & Sistema*\n\n"
