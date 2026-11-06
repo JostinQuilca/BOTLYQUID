@@ -200,7 +200,7 @@ class HyperliquidExecutor:
                         fill_px = float(filled_data.get("avgPx", order_px))
                         fill_sz = float(filled_data.get("totalSz", approved.approved_size))
                         oid = int(filled_data.get("oid", 0))
-                        await self.on_fill(cloid, fill_px, fill_sz, oid)
+                        await self.on_fill(cloid, fill_px, fill_sz, oid, fill_data=filled_data)
                         return
 
             # Esperar fill con timeout via asyncio.Event
@@ -258,7 +258,7 @@ class HyperliquidExecutor:
                         fill_px = float(filled_data.get("avgPx", approved.approved_price))
                         fill_sz = float(filled_data.get("totalSz", approved.approved_size))
                         oid = int(filled_data.get("oid", 0))
-                        await self.on_fill(cloid, fill_px, fill_sz, oid)
+                        await self.on_fill(cloid, fill_px, fill_sz, oid, fill_data=filled_data)
                         return
 
             if not filled:
@@ -281,11 +281,26 @@ class HyperliquidExecutor:
         fill_price: float,
         fill_size: float,
         oid: int,
+        fill_data: dict[str, Any] | None = None,
     ) -> None:
         """
         Llamado cuando llega un fill (del REST o del canal userEvents).
         Inicia la colocación automática de Stop Loss y Take Profit.
         """
+        fill_data = fill_data or {}
+        dir_str = str(fill_data.get("dir", ""))
+        closed_pnl = float(fill_data.get("closedPnl", 0.0) or 0.0)
+        is_closing_fill = dir_str.startswith("Close") or closed_pnl != 0.0
+
+        if self._sm.state == ExecutorState.OPEN_PROTECTED and is_closing_fill:
+            logger.info(
+                "Closing fill detected in OPEN_PROTECTED (dir='%s', closedPnl=%.4f). Calling on_tp_sl_trigger...",
+                dir_str,
+                closed_pnl,
+            )
+            await self.on_tp_sl_trigger("TP_OR_SL", fill_price)
+            return
+
         if self._sm.state in (ExecutorState.OPEN_PROTECTED, ExecutorState.OPEN_UNPROTECTED):
             # Partial fill adicional: acumular tamaño y re-proteger
             self._filled_size = getattr(self, "_filled_size", 0.0) + fill_size
@@ -526,28 +541,82 @@ class HyperliquidExecutor:
         )
         await self._emergency_close(fill_size, "TP/SL placement failed")
 
-    async def on_position_closed(self, reason: str = "TP/SL hit") -> None:
+    async def on_tp_sl_trigger(self, trigger_type: str = "TP_OR_SL", fill_price: float = 0.0) -> None:
         """
-        Llamado cuando la posición se cierra en el exchange (por TP, SL o cierre manual).
-        Cancela cualquier orden residual y regresa la máquina de estados a FLAT.
+        Llamado cuando se ejecuta una orden TP o SL (o fill de cierre).
+        Cancela cualquier orden residual de protección en el exchange y
+        transiciona la máquina de estados a FLAT (pasando por CLOSING si aplica).
         """
-        logger.info("Position closed (%s). Cleaning up residual orders...", reason)
+        logger.info(
+            "on_tp_sl_trigger: %s @ %.2f. Cancelando órdenes residuales...",
+            trigger_type,
+            fill_price,
+        )
         try:
             await asyncio.to_thread(self._exchange.cancel_all, self._symbol)
-            logger.info("Residual orders cancelled for %s", self._symbol)
+            logger.info("Residual protection orders cancelled for %s", self._symbol)
         except Exception:
-            logger.exception("Failed to cancel residual orders on position close")
+            logger.exception("Failed to cancel residual protection orders on TP/SL trigger")
 
         self._active_order = None
         self._active_entry_cloid = None
         self._active_sl_oid = None
         self._active_tp_oid = None
+        self._filled_size = 0.0
 
         if self._sm.state not in (ExecutorState.FLAT, ExecutorState.HALTED):
             try:
-                await self._sm.transition(ExecutorState.FLAT, reason)
+                if self._sm.state == ExecutorState.OPEN_PROTECTED:
+                    try:
+                        await self._sm.transition(ExecutorState.CLOSING, f"{trigger_type} hit")
+                    except InvalidTransitionError:
+                        pass
+                await self._sm.transition(ExecutorState.FLAT, f"{trigger_type} completed")
             except InvalidTransitionError:
                 pass
+
+    # Alias en caso de ser invocado con mayúscula según convención
+    on_tp_sl_Trigger = on_tp_sl_trigger
+
+    async def on_position_closed(self, reason: str = "TP/SL hit") -> None:
+        """
+        Llamado cuando la posición se cierra en el exchange (por TP, SL o cierre manual).
+        Cancela cualquier orden residual y regresa la máquina de estados a FLAT.
+        """
+        await self.on_tp_sl_trigger(reason, 0.0)
+
+    async def reconcile_state(self, position_size: float) -> None:
+        """
+        Reconcilia el estado del ejecutor con la posición real del exchange.
+        Si la posición en el exchange es 0 y el estado es OPEN_PROTECTED/OPEN_UNPROTECTED/CLOSING,
+        limpia órdenes residuales y regresa a FLAT.
+        """
+        if abs(position_size) < 1e-6:
+            if self._sm.state in (
+                ExecutorState.OPEN_PROTECTED,
+                ExecutorState.OPEN_UNPROTECTED,
+                ExecutorState.CLOSING,
+            ):
+                logger.info(
+                    "reconcile_state: position is 0 on exchange while state=%s. Transitioning to FLAT",
+                    self._sm.state.value,
+                )
+                await self.on_tp_sl_trigger("Reconcile (pos=0)", 0.0)
+        else:
+            if self._sm.state == ExecutorState.FLAT:
+                logger.warning(
+                    "reconcile_state: position %.5f exists on exchange while FLAT. Transitioning to OPEN_UNPROTECTED",
+                    position_size,
+                )
+                try:
+                    await self._sm.transition(
+                        ExecutorState.ENTRY_PENDING, "reconcile: external position found"
+                    )
+                    await self._sm.transition(
+                        ExecutorState.OPEN_UNPROTECTED, "reconcile: external position found"
+                    )
+                except InvalidTransitionError:
+                    pass
 
     # ── Cierre de emergencia ───────────────────────────────────────────────────
 

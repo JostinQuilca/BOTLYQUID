@@ -329,14 +329,9 @@ class HyperliquidIngestor:
                 # orden de entrada, así que cualquier fill que llegue en ese
                 # momento es, por definición, el fill de apertura que buscamos.
                 from execution.state_machine import ExecutorState
-                executor_awaiting_entry = (
-                    self._executor is not None
-                    and getattr(self._executor, "_sm", None) is not None
-                    and self._executor._sm.state == ExecutorState.ENTRY_PENDING
-                )
-                if ("Open" in dir_str or executor_awaiting_entry) and self._executor:
+                if self._executor:
                     active_cloid = getattr(self._executor, "_active_entry_cloid", None)
-                    await self._executor.on_fill(active_cloid, px, sz, oid)
+                    await self._executor.on_fill(active_cloid, px, sz, oid, fill_data=fill)
 
                 # Si es cierre o tiene PnL cerrado
                 if "Close" in dir_str or abs(closed_pnl) > 0:
@@ -370,6 +365,13 @@ class HyperliquidIngestor:
                         await self._executor.on_position_closed(f"Fill {dir_str}")
 
     # ── Reconciliador REST ─────────────────────────────────────────────────────
+
+    async def fetch_initial_account_state(self) -> None:
+        """
+        Consulta REST al exchange para sincronizar el estado completo de la cuenta:
+        equity (Perp + Spot), posiciones, unrealized PnL y órdenes abiertas.
+        """
+        await self._reconcile_with_exchange()
 
     async def _reconcile_loop(self) -> None:
         """

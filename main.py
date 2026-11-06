@@ -501,6 +501,22 @@ async def main() -> None:
                     logger.warning("Telegram no disponible: %s — bot continua sin alertas", e)
                     return
 
+        async def reconciliation_loop() -> None:
+            """
+            Reconciliación periódica cada 60s:
+            1. Consulta el estado real del exchange (equity, position_size).
+            2. Reconcilia la máquina de estados del executor con la posición real.
+            """
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    await ingestor.fetch_initial_account_state()
+                    if executor:
+                        pos_sz = market_state.account.position_size
+                        await executor.reconcile_state(pos_sz)
+                except Exception:
+                    logger.exception("Error en reconciliation_loop")
+
         # Iniciar dashboard web HTTP nativo en el puerto 8080 (Fly.io)
         from monitoring.web_server import start_web_server
         port = int(os.environ.get("PORT", "8080"))
@@ -509,11 +525,23 @@ async def main() -> None:
         except Exception as e:
             logger.warning("No se pudo iniciar el dashboard web en puerto %d: %s", port, e)
 
+        # Cargar estado inicial de cuenta y posición desde el exchange
+        try:
+            await ingestor.fetch_initial_account_state()
+            logger.info(
+                "Estado inicial de cuenta cargado: Equity=$%.2f, Pos=%.5f BTC",
+                market_state.account.equity,
+                market_state.account.position_size,
+            )
+        except Exception as e:
+            logger.warning("No se pudo cargar el estado inicial de cuenta: %s", e)
+
         tasks = [
             asyncio.create_task(db_worker.run(), name="db_worker"),
             asyncio.create_task(ingestor.run(db), name="ingestor"),
             asyncio.create_task(ext_signals.run(), name="external_signals"),
             asyncio.create_task(signal_evaluation_loop(), name="signal_loop"),
+            asyncio.create_task(reconciliation_loop(), name="reconciliation"),
             asyncio.create_task(heartbeat_loop(), name="heartbeat"),
             asyncio.create_task(shadow_pnl_resolver_loop(), name="shadow_pnl_resolver"),
             asyncio.create_task(telegram_loop(), name="telegram"),

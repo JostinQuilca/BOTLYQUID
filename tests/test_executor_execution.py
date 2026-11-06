@@ -125,3 +125,47 @@ class TestExecutorExecution:
 
         assert executor.last_order_filled is False
         assert sm.state == ExecutorState.FLAT
+
+    @pytest.mark.asyncio
+    async def test_on_fill_close_in_open_protected_calls_on_tp_sl_trigger(self):
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.cancel_all.return_value = {"status": "ok"}
+
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        # Simular que ya está en OPEN_PROTECTED
+        await sm.transition(ExecutorState.ENTRY_PENDING, "test")
+        await sm.transition(ExecutorState.OPEN_PROTECTED, "test")
+        executor._filled_size = 0.00136
+
+        # Recibir fill de cierre
+        close_fill_data = {
+            "dir": "Close Short",
+            "closedPnl": 0.10064,
+            "px": 76197.0,
+            "sz": 0.00136,
+        }
+        await executor.on_fill(None, 76197.0, 0.00136, 999, fill_data=close_fill_data)
+
+        # Debe transicionar a FLAT y cancelar órdenes de protección residuales
+        assert sm.state == ExecutorState.FLAT
+        mock_exchange.cancel_all.assert_called_once_with("BTC")
+        # _filled_size debe haberse reiniciado a 0, NO sumado
+        assert executor._filled_size == 0.0
+
+    @pytest.mark.asyncio
+    async def test_reconcile_state_cleans_up_when_position_zero(self):
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.cancel_all.return_value = {"status": "ok"}
+
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        # Poner en OPEN_PROTECTED
+        await sm.transition(ExecutorState.ENTRY_PENDING, "test")
+        await sm.transition(ExecutorState.OPEN_PROTECTED, "test")
+
+        # Reconciliación detecta que en el exchange la posición es 0.0
+        await executor.reconcile_state(0.0)
+
+        assert sm.state == ExecutorState.FLAT
+        mock_exchange.cancel_all.assert_called_once_with("BTC")
