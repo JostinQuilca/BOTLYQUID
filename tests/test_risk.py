@@ -604,6 +604,59 @@ class TestPersistencia:
         assert row is not None
         assert row["kill_switch"] == 1
 
+    @pytest.mark.asyncio
+    async def test_v7_daily_trade_limit_15(self, fresh_db):
+        """v7: Permite hasta 14 trades al día y veta en el 15vo."""
+        validator = RiskValidator(fresh_db, sz_decimals=4, min_notional_usd=10.0, settings=make_live_settings())
+        signal = _make_signal_for_risk()
+        state = _make_state_risk(equity=100.0)
+        now_ms = int(time.time() * 1000)
+
+        # Insertar 14 trades abiertos hoy
+        for i in range(14):
+            await fresh_db.execute(
+                "INSERT INTO live_fills (oid, coin, dir, px, sz, ts_ms) VALUES (?, ?, ?, ?, ?, ?)",
+                (i + 1, "BTC", "Open Long", 80000.0, 0.001, now_ms),
+            )
+        await fresh_db.commit()
+
+        # Trade 15 aún debe ser aprobado (count=14 < 15)
+        approved = await validator.validate(signal, state, shadow_mode=False)
+        assert approved is not None
+
+        # Insertar el 15vo trade
+        await fresh_db.execute(
+            "INSERT INTO live_fills (oid, coin, dir, px, sz, ts_ms) VALUES (?, ?, ?, ?, ?, ?)",
+            (15, "BTC", "Open Long", 80000.0, 0.001, now_ms),
+        )
+        await fresh_db.commit()
+
+        # Trade 16 debe ser vetado por RISK_DAILY_LIMIT
+        with pytest.raises(VetoException) as exc_info:
+            await validator.validate(signal, state, shadow_mode=False)
+        assert exc_info.value.reason.value == "RISK_DAILY_LIMIT"
+
+    @pytest.mark.asyncio
+    async def test_v7_streak_3_losses_cooldown(self, fresh_db):
+        """v7: Racha de 3 pérdidas consecutivas (< -0.05) activa veto RISK_COOLDOWN por 1 hora."""
+        validator = RiskValidator(fresh_db, sz_decimals=4, min_notional_usd=10.0, settings=make_live_settings())
+        signal = _make_signal_for_risk(side=SignalSide.BUY)
+        state = _make_state_risk(equity=100.0)
+        now_ms = int(time.time() * 1000)
+
+        # Insertar 3 pérdidas consecutivas recientes (< 1h)
+        for i in range(3):
+            await fresh_db.execute(
+                "INSERT INTO live_fills (oid, coin, dir, px, sz, closed_pnl, ts_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (i + 10, "BTC", "Close Short", 80000.0, 0.001, -0.10, now_ms - (i * 60_000)),
+            )
+        await fresh_db.commit()
+
+        with pytest.raises(VetoException) as exc_info:
+            await validator.validate(signal, state, shadow_mode=False)
+        assert exc_info.value.reason.value == "RISK_COOLDOWN"
+        assert "Racha de 3 pérdidas consecutivas" in exc_info.value.detail
+
 
 class TestApplySizeMultiplier:
 
@@ -672,14 +725,14 @@ class TestRSIWilderYCooldown:
         assert rsi_val is not None
         assert rsi_val < 10.0, f"RSI bajista esperado < 10, got {rsi_val:.1f}"
 
-    def test_mark_signal_dispatched_activa_cooldown_90min(self):
-        """mark_signal_dispatched activa cooldown completo de 90 min."""
+    def test_mark_signal_dispatched_activa_cooldown_25min(self):
+        """mark_signal_dispatched activa cooldown completo de 25 min = 1500s."""
         from signals.engine import DecisionEngine
         engine = DecisionEngine(shadow_mode=True)
         engine.mark_signal_dispatched()
-        # Después de dispatch, el gap debe ser casi 90 min
+        # Después de dispatch, el gap debe ser casi 25 min
         remaining = engine._min_signal_gap_s - (time.monotonic() - engine._last_signal_at)
-        assert remaining > 5000   # > 83 min restantes
+        assert remaining > 1400   # > 23 min restantes
 
     def test_mark_signal_rejected_cooldown_corto(self):
         """mark_signal_rejected(60s) deja solo 60s de cooldown."""

@@ -185,6 +185,9 @@ async def main() -> None:
     async def signal_evaluation_loop() -> None:
         """Evalua señales cada 1 segundo (en velas de 1m)."""
         _last_manage_at: float = 0.0
+        # v7: anti-spam de alertas de veto
+        _last_veto_alert_reason: str = ""
+        _last_veto_alert_at: float = 0.0
         while True:
             await asyncio.sleep(1.0)
             try:
@@ -194,6 +197,12 @@ async def main() -> None:
                 if executor and (now - _last_manage_at) >= 5.0:
                     _last_manage_at = now
                     await executor.manage_open_position(market_state)
+
+                # v7: skip evaluación de nuevas entradas si hay posición abierta (LIVE)
+                if not settings.shadow_mode and executor:
+                    from execution.state_machine import ExecutorState
+                    if executor._sm.state != ExecutorState.FLAT:
+                        continue
 
                 if market_state.is_warm:
                     signal = decision_engine.evaluate(market_state)
@@ -317,13 +326,18 @@ async def main() -> None:
                             decision_engine.mark_signal_rejected(60.0)
                             if not settings.shadow_mode and alerter:
                                 try:
-                                    await alerter.send(
-                                        f"🛡️ *SEÑAL VETADA POR RIESGO*\n"
-                                        f"Estrategia: `{signal.strategy}` ({signal.side.value if hasattr(signal.side, 'value') else signal.side})\n"
-                                        f"Motivo: `{str(veto)}`\n"
-                                        f"Capital protegido. Reevaluando en 60s...",
-                                        alert_type="WARNING",
-                                    )
+                                    # v7: anti-spam — solo enviar alerta si cambió la razón o pasaron 30 min
+                                    veto_str = str(veto)
+                                    if veto_str != _last_veto_alert_reason or (time.monotonic() - _last_veto_alert_at) > 1800:
+                                        _last_veto_alert_reason = veto_str
+                                        _last_veto_alert_at = time.monotonic()
+                                        await alerter.send(
+                                            f"🛡️ *SEÑAL VETADA POR RIESGO*\n"
+                                            f"Estrategia: `{signal.strategy}` ({signal.side.value if hasattr(signal.side, 'value') else signal.side})\n"
+                                            f"Motivo: `{veto_str}`\n"
+                                            f"Capital protegido. Reevaluando en 60s...",
+                                            alert_type="WARNING",
+                                        )
                                 except Exception:
                                     pass
                             await db_worker.put(

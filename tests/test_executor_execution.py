@@ -169,3 +169,31 @@ class TestExecutorExecution:
 
         assert sm.state == ExecutorState.FLAT
         mock_exchange.cancel_all.assert_called_once_with("BTC")
+
+    @pytest.mark.asyncio
+    async def test_on_fill_deduplicates_entry_fill_from_ws(self):
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.order.return_value = {
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 111}}, {"resting": {"oid": 222}}]}},
+        }
+
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        approved = _make_sample_approved(OrderType.IOC)
+        executor._active_order = approved
+
+        await sm.transition(ExecutorState.ENTRY_PENDING, "test")
+
+        # 1. Primer fill (REST response)
+        entry_fill = {"dir": "Open Long", "closedPnl": 0.0, "avgPx": 76000.0, "totalSz": 0.001}
+        await executor.on_fill("0x123", 76000.0, 0.001, 8888, fill_data=entry_fill)
+
+        assert sm.state == ExecutorState.OPEN_PROTECTED
+        assert executor._filled_size == 0.001
+
+        # 2. Segundo fill idéntico desde WebSocket userEvents
+        await executor.on_fill("0x123", 76000.0, 0.001, 8888, fill_data=entry_fill)
+
+        # Debe ignorarse: _filled_size NO debe duplicarse a 0.002
+        assert executor._filled_size == 0.001

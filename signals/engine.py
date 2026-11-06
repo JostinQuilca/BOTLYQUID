@@ -48,10 +48,11 @@ logger = logging.getLogger(__name__)
 # ── Constantes de control global ──────────────────────────────────────────────
 
 # Máximo trades por día (seguridad extra: el risk validator también controla)
-MAX_TRADES_PER_DAY = 2
+# Techo técnico diario alto; Gap 25min
+MAX_TRADES_PER_DAY = 15
 
-# Gap mínimo entre señales: 90 minutos
-MIN_SIGNAL_GAP_SECONDS = 5400.0
+# Gap mínimo entre señales: 25 minutos
+MIN_SIGNAL_GAP_SECONDS = 1500.0
 
 # Confianza mínima para que una señal pase al ejecutor
 MIN_CONFIDENCE = 0.68
@@ -155,7 +156,7 @@ class SmartMoneyFVGReversal:
     MIN_CANDLES = 35
     FVG_SEARCH_WINDOW = 10          # últimas N velas para buscar FVGs
     MIN_FVG_ATR_RATIO = 0.15        # gap debe ser >= 15% del ATR_5m
-    OBI_MIN_THRESHOLD = 0.08        # umbral mínimo de OBI
+    OBI_MIN_THRESHOLD = 0.12        # umbral mínimo de OBI (v7: subido de 0.08 → 0.12)
 
     def evaluate(
         self,
@@ -233,17 +234,22 @@ class SmartMoneyFVGReversal:
         c_now_body = c_now.close - c_now.open
         c_prev_body = c_prev.close - c_prev.open
 
+        upper_wick = c_now.high - max(c_now.open, c_now.close)
+        lower_wick = min(c_now.open, c_now.close) - c_now.low
+
         is_bullish_engulfing = (
             c_now.close > c_now.open                            # vela actual verde
             and c_prev.close < c_prev.open                     # vela anterior roja
             and c_now.close >= c_prev.open                     # cierra encima del open anterior
             and c_now_body > abs(c_prev_body)                  # cuerpo mayor
+            and upper_wick <= c_now_body                       # v7: mecha superior pequeña
         )
         is_bearish_engulfing = (
             c_now.close < c_now.open                           # vela actual roja
             and c_prev.close > c_prev.open                     # vela anterior verde
             and c_now.close <= c_prev.open                     # cierra debajo del open anterior
             and abs(c_now_body) > c_prev_body                  # cuerpo mayor
+            and lower_wick <= abs(c_now_body)                  # v7: mecha inferior pequeña
         )
 
         # ── C.5. Killzone Nueva York (13:30 – 17:00 UTC) ─────────────────────
@@ -493,7 +499,7 @@ class TrendMomentumV4:
                 return SignalProposal(
                     strategy="TrendMomentumV4",
                     side=SignalSide.BUY,
-                    order_type=OrderType.ALO,
+                    order_type=OrderType.IOC,
                     proposed_price=mid,
                     stop_loss=round(mid - sl_dist, 2),
                     take_profit=round(mid + tp_dist, 2),
@@ -535,7 +541,7 @@ class TrendMomentumV4:
                 return SignalProposal(
                     strategy="TrendMomentumV4",
                     side=SignalSide.SELL,
-                    order_type=OrderType.ALO,
+                    order_type=OrderType.IOC,
                     proposed_price=mid,
                     stop_loss=round(mid + sl_dist, 2),
                     take_profit=round(mid - tp_dist, 2),

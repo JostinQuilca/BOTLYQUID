@@ -86,6 +86,7 @@ class HyperliquidExecutor:
         self._moved_to_be: bool = False       # Flag de break-even ya aplicado
         self._entry_time: float = 0.0         # Tiempo de apertura de posición
         self.last_order_filled: bool = False  # Flag indicando si la última orden se llenó
+        self._processed_fill_keys: set[str] = set()  # v7: dedup fills REST vs WS
 
         # Monitorear archivo STOP_BOT.flag
         asyncio.get_event_loop().create_task(self._monitor_kill_flag())
@@ -133,6 +134,7 @@ class HyperliquidExecutor:
         self._active_entry_cloid = cloid
         self._fill_event.clear()
         self.last_order_filled = False
+        self._processed_fill_keys.clear()  # v7: limpiar dedup al inicio de cada trade
 
         logger.info(
             "Executing %s %s %.5f BTC @ %.2f (cloid=%s, order_type=%s, TP=%.2f, SL=%.2f)",
@@ -291,6 +293,14 @@ class HyperliquidExecutor:
         dir_str = str(fill_data.get("dir", ""))
         closed_pnl = float(fill_data.get("closedPnl", 0.0) or 0.0)
         is_closing_fill = dir_str.startswith("Close") or closed_pnl != 0.0
+
+        # v7: deduplicar fills de entrada (REST response + WS userEvents envían el mismo fill)
+        fill_key = f"{oid}:{fill_size:.5f}:{'close' if is_closing_fill else 'open'}"
+        if not is_closing_fill and oid > 0 and fill_key in self._processed_fill_keys:
+            logger.debug("Ignorando fill de entrada duplicado (REST+WS): %s", fill_key)
+            return
+        if oid > 0:
+            self._processed_fill_keys.add(fill_key)
 
         if self._sm.state == ExecutorState.OPEN_PROTECTED and is_closing_fill:
             logger.info(

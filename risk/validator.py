@@ -72,7 +72,9 @@ class RiskValidator:
     FUNDING_ADVERSE_ANNUALIZED_PCT = 25.0   # 25% anualizado = funding adverso
 
     # v4: Límite de trades por día (extra seguridad, el motor también lo controla)
-    MAX_TRADES_PER_DAY = 2
+    # v7: Subido de 2 → 15 (Techo técnico diario alto)
+    MAX_TRADES_PER_DAY = 15
+    MAX_CONSECUTIVE_LOSSES = 3
 
     def __init__(
         self,
@@ -384,37 +386,72 @@ class RiskValidator:
 
     async def _check_loss_cooldown(self, signal: SignalProposal) -> None:
         """
-        Cooldown tras pérdida: si la última operación cerrada fue una pérdida
-        y ocurrió hace menos de 900s (15 min), bloquear reintentos en la misma dirección.
+        v7: Cooldown por racha de pérdidas consecutivas.
+
+        1. Si las últimas 3 operaciones cerradas tienen net_pnl < -0.05
+           y la última fue hace menos de 3600s → veto RISK_COOLDOWN (racha de 3).
+        2. Si la última operación fue una pérdida < -0.05 hace menos de 900s
+           y la señal va en la misma dirección → veto RISK_COOLDOWN (cooldown 15 min).
         """
-        COOLDOWN_SECONDS = 900  # 15 minutos
         try:
+            # Obtener las últimas MAX_CONSECUTIVE_LOSSES operaciones cerradas
             async with self._db.execute(
-                "SELECT dir, closed_pnl, ts_ms FROM live_fills WHERE closed_pnl != 0 ORDER BY ts_ms DESC LIMIT 1"
+                "SELECT dir, closed_pnl, ts_ms FROM live_fills "
+                "WHERE (closed_pnl != 0 OR dir LIKE 'Close%') "
+                "ORDER BY ts_ms DESC LIMIT ?",
+                (self.MAX_CONSECUTIVE_LOSSES,),
             ) as cursor:
-                row = await cursor.fetchone()
+                rows = await cursor.fetchall()
 
-            if row:
-                dir_str = row[0] if isinstance(row, tuple) else row["dir"]
-                closed_pnl = float(row[1] if isinstance(row, tuple) else row["closed_pnl"])
-                ts_ms = int(row[2] if isinstance(row, tuple) else row["ts_ms"])
+            if not rows:
+                return
 
-                now_ms = time.time() * 1000
-                elapsed_s = (now_ms - ts_ms) / 1000.0
+            now_ms = time.time() * 1000
 
-                if closed_pnl < 0 and elapsed_s < COOLDOWN_SECONDS:
-                    was_long = "Long" in str(dir_str)
-                    was_short = "Short" in str(dir_str)
+            # -- Regla 1: racha de N pérdidas consecutivas --
+            if len(rows) >= self.MAX_CONSECUTIVE_LOSSES:
+                all_losses = True
+                latest_ts_ms = 0
+                for row in rows:
+                    pnl = float(row[1] if isinstance(row, tuple) else row["closed_pnl"])
+                    ts = int(row[2] if isinstance(row, tuple) else row["ts_ms"])
+                    if pnl >= -0.05:
+                        all_losses = False
+                        break
+                    latest_ts_ms = max(latest_ts_ms, ts)
 
-                    if (signal.side == SignalSide.BUY and was_long) or (
-                        signal.side == SignalSide.SELL and was_short
-                    ):
-                        remaining_m = int((COOLDOWN_SECONDS - elapsed_s) / 60) + 1
+                if all_losses:
+                    elapsed_s = (now_ms - latest_ts_ms) / 1000.0
+                    if elapsed_s < 3600:
+                        remaining_m = int((3600 - elapsed_s) / 60) + 1
                         raise VetoException(
                             VetoReason.RISK_COOLDOWN,
-                            f"Cooldown activo: pérdida reciente ({closed_pnl:+.4f} USDC hace {int(elapsed_s/60)}m). "
-                            f"Esperando {remaining_m}m antes de otro {signal.side.value}",
+                            f"Racha de {self.MAX_CONSECUTIVE_LOSSES} pérdidas consecutivas. "
+                            f"Cooldown 1h activo. Reactivando en {remaining_m}min.",
                         )
+
+            # -- Regla 2: cooldown 15 min tras pérdida en la misma dirección --
+            COOLDOWN_SECONDS = 900  # 15 minutos
+            last_row = rows[0]
+            dir_str = str(last_row[0] if isinstance(last_row, tuple) else last_row["dir"])
+            closed_pnl = float(last_row[1] if isinstance(last_row, tuple) else last_row["closed_pnl"])
+            ts_ms = int(last_row[2] if isinstance(last_row, tuple) else last_row["ts_ms"])
+
+            elapsed_s = (now_ms - ts_ms) / 1000.0
+
+            if closed_pnl < -0.05 and elapsed_s < COOLDOWN_SECONDS:
+                was_long = "Long" in dir_str
+                was_short = "Short" in dir_str
+
+                if (signal.side == SignalSide.BUY and was_long) or (
+                    signal.side == SignalSide.SELL and was_short
+                ):
+                    remaining_m = int((COOLDOWN_SECONDS - elapsed_s) / 60) + 1
+                    raise VetoException(
+                        VetoReason.RISK_COOLDOWN,
+                        f"Cooldown activo: pérdida reciente ({closed_pnl:+.4f} USDC hace {int(elapsed_s/60)}m). "
+                        f"Esperando {remaining_m}m antes de otro {signal.side.value}",
+                    )
         except VetoException:
             raise
         except Exception as e:
