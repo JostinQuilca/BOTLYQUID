@@ -625,6 +625,40 @@ class HyperliquidExecutor:
                 except InvalidTransitionError:
                     pass
 
+    async def adopt_existing_position(
+        self,
+        signed_size: float,
+        entry_price: float,
+        active_tp_px: float,
+        active_sl_px: float,
+        tp_oid: int | None = None,
+        sl_oid: int | None = None,
+    ) -> None:
+        """
+        Sincroniza el ejecutor cuando existe una posición abierta y protegida
+        en el exchange (ej. tras un reinicio del contenedor en Fly.io).
+        """
+        self._filled_size = abs(signed_size)
+        if self._entry_time <= 0.0:
+            self._entry_time = time.monotonic()
+        if tp_oid:
+            self._active_tp_oid = tp_oid
+        if sl_oid:
+            self._active_sl_oid = sl_oid
+
+        if active_tp_px > 0 and active_sl_px > 0:
+            try:
+                if self._sm.state == ExecutorState.FLAT:
+                    await self._sm.transition(ExecutorState.ENTRY_PENDING, "adopt existing position")
+                    await self._sm.transition(ExecutorState.OPEN_UNPROTECTED, "adopt existing position")
+                if self._sm.state == ExecutorState.OPEN_UNPROTECTED:
+                    await self._sm.transition(
+                        ExecutorState.OPEN_PROTECTED,
+                        f"Adopted protected position: TP={active_tp_px:.1f}, SL={active_sl_px:.1f}",
+                    )
+            except InvalidTransitionError:
+                pass
+
     # ── Cierre de emergencia ───────────────────────────────────────────────────
 
     async def _emergency_close(self, size: float, reason: str) -> None:
@@ -696,23 +730,34 @@ class HyperliquidExecutor:
            si lleva >= 8 min abierta y avanza >= +0.15% a favor, cobra ganancia a mercado.
         3. Time-Stop a los 20 min si la operación queda estancada.
         """
-        if self._sm.state != ExecutorState.OPEN_PROTECTED:
-            return
-        if self._active_order is None or self._kill_switch_active:
+        if self._sm.state != ExecutorState.OPEN_PROTECTED or self._kill_switch_active:
             return
 
-        signal = self._active_order.signal
-        entry_price = state.account.position_entry_price or self._active_order.approved_price
+        if self._active_order is not None:
+            signal = self._active_order.signal
+            is_long = signal.side == SignalSide.BUY
+            entry_price = state.account.position_entry_price or self._active_order.approved_price
+            initial_sl = self._active_order.approved_stop_loss
+        else:
+            # Fallback tras reinicio del contenedor con posición adoptada desde Hyperliquid
+            if not state.account or not state.account.has_position:
+                return
+            is_long = state.account.position_size > 0
+            entry_price = state.account.position_entry_price
+            initial_sl = state.account.active_sl_px
+            if self._filled_size <= 0:
+                self._filled_size = abs(state.account.position_size)
+            if self._entry_time <= 0:
+                self._entry_time = time.monotonic()
+
         mark_price = state.asset_ctx.mark_price if state.asset_ctx else 0.0
         if mark_price <= 0 or entry_price <= 0:
             return
 
-        initial_sl = self._active_order.approved_stop_loss
-        sl_dist = abs(entry_price - initial_sl)
+        sl_dist = abs(entry_price - initial_sl) if initial_sl > 0 else (entry_price * 0.0030)
         if sl_dist <= 0:
             return
 
-        is_long = signal.side == SignalSide.BUY
         move_pct = ((mark_price - entry_price) / entry_price) if is_long else ((entry_price - mark_price) / entry_price)
         pnl_r = ((mark_price - entry_price) / sl_dist) if is_long else ((entry_price - mark_price) / sl_dist)
         elapsed_minutes = (time.monotonic() - self._entry_time) / 60.0

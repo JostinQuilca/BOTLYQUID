@@ -239,3 +239,45 @@ class TestExecutorExecution:
         args, kwargs = mock_exchange.order.call_args
         placed_price = args[3]
         assert placed_price == 76076.0
+
+    @pytest.mark.asyncio
+    async def test_adopt_existing_position_transitions_to_open_protected(self):
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+
+        assert sm.state == ExecutorState.FLAT
+        await executor.adopt_existing_position(
+            signed_size=-0.00028,
+            entry_price=75626.0,
+            active_tp_px=74422.0,
+            active_sl_px=76238.0,
+            tp_oid=598086002267,
+            sl_oid=598085996887,
+        )
+
+        assert sm.state == ExecutorState.OPEN_PROTECTED
+        assert executor._filled_size == 0.00028
+        assert executor._active_tp_oid == 598086002267
+        assert executor._active_sl_oid == 598085996887
+
+        # Test manage_open_position without _active_order using state.account
+        state = MagicMock()
+        state.account.has_position = True
+        state.account.position_size = -0.00028
+        state.account.position_entry_price = 75626.0
+        state.account.active_sl_px = 76238.0
+        # Mark price moved 0.20% in favor (SHORT -> price down to 75450)
+        state.asset_ctx.mark_price = 75450.0
+
+        mock_exchange.order.return_value = {
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 888}}]}},
+        }
+        mock_exchange.cancel.return_value = {"status": "ok"}
+
+        await executor.manage_open_position(state)
+        assert executor._moved_to_be is True
+        mock_exchange.order.assert_called_once()
+        args, kwargs = mock_exchange.order.call_args
+        assert args[3] == float(round(75626.0 * 0.9990))

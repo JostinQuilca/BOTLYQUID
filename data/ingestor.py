@@ -509,18 +509,32 @@ class HyperliquidIngestor:
 
         active_tp = 0.0
         active_sl = 0.0
+        active_tp_oid: int | None = None
+        active_sl_oid: int | None = None
         if isinstance(open_orders, list):
             for o in open_orders:
                 if o.get("coin") == self._symbol:
                     order_type = str(o.get("orderType", ""))
                     tpsl_type = str(o.get("tpsl", ""))
+                    oid_val = int(o["oid"]) if "oid" in o and o["oid"] is not None else None
                     trig_px = float(o.get("triggerPx") or 0.0)
-                    if not trig_px and "triggerPx" in o:
-                        trig_px = float(o["triggerPx"])
+                    limit_px = float(o.get("limitPx") or 0.0)
+                    px_val = trig_px if trig_px > 0 else limit_px
+
                     if tpsl_type == "tp" or "take" in order_type.lower():
-                        active_tp = trig_px
+                        active_tp = px_val
+                        active_tp_oid = oid_val
                     elif tpsl_type == "sl" or "stop" in order_type.lower():
-                        active_sl = trig_px
+                        active_sl = px_val
+                        active_sl_oid = oid_val
+                    elif abs(real_pos) > 1e-6 and entry_px > 0 and px_val > 0:
+                        # Orden Limit reduceOnly sin etiqueta tpsl explícita
+                        if (real_pos > 0 and px_val > entry_px) or (real_pos < 0 and px_val < entry_px):
+                            active_tp = px_val
+                            active_tp_oid = oid_val
+                        else:
+                            active_sl = px_val
+                            active_sl_oid = oid_val
 
         self._state.account.active_tp_px = active_tp
         self._state.account.active_sl_px = active_sl
@@ -558,6 +572,11 @@ class HyperliquidIngestor:
                 await self._executor.ensure_protected(entry_px, real_pos)
             except Exception:
                 logger.exception("Fallo al recolocar SL/TP desde el reconciliador")
+
+        elif active_tp > 0.0 and active_sl > 0.0 and self._executor and hasattr(self._executor, "adopt_existing_position"):
+            await self._executor.adopt_existing_position(
+                real_pos, entry_px, active_tp, active_sl, active_tp_oid, active_sl_oid
+            )
 
         # ── 4. Sincronizar fills recientes desde REST (resiliencia) ───────────
         try:

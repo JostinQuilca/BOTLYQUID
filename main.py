@@ -445,10 +445,11 @@ async def main() -> None:
                             if matching_candles:
                                 exit_price = matching_candles[0].close
 
+                            TAKER_ROUNDTRIP_FEE_PCT = 0.000864  # 2 x 0.0432% Taker fee en Hyperliquid
                             if str(side).upper() == "BUY":
-                                pnl_pct = (exit_price - entry_price) / entry_price
+                                pnl_pct = ((exit_price - entry_price) / entry_price) - TAKER_ROUNDTRIP_FEE_PCT
                             else:
-                                pnl_pct = (entry_price - exit_price) / entry_price
+                                pnl_pct = ((entry_price - exit_price) / entry_price) - TAKER_ROUNDTRIP_FEE_PCT
 
                             await db.execute(
                                 """

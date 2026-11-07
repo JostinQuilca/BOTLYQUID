@@ -471,16 +471,16 @@ class TrendMomentumV4:
         obi = snap.obi.value
         cvd = snap.cvd
 
-        # ATR para SL
-        atr = _atr(candles, 14) or snap.volatility.atr_1h
-        if atr is None:
+        # ATR de 5m real y filtro de mercado muerto
+        atr_5m = snap.volatility.atr_5m
+        if atr_5m is None or atr_5m < mid * 0.0008:
             return None
 
-        # SL: 1.2x ATR, mínimo 0.8% del precio, máximo 1.5%
-        min_sl_dist = mid * 0.008
-        sl_dist = max(1.2 * atr, min_sl_dist)
-        sl_dist = min(sl_dist, mid * 0.015)
-        tp_dist = sl_dist * self.RR_RATIO   # R:R 2:1
+        # SL calibrado v9: entre 0.25% (~$190) y 0.35% (~$265) del precio
+        min_sl_dist = max(0.9 * atr_5m, mid * 0.0025)
+        sl_dist = min(min_sl_dist, mid * 0.0035)
+        tp_dist = max(sl_dist * 1.4, mid * 0.0035)
+        effective_r = round(tp_dist / sl_dist, 2)
 
         # Volumen actual vs promedio
         recent_volume = candles[-1].volume
@@ -523,8 +523,8 @@ class TrendMomentumV4:
                     cvd_5m=cvd.cvd_5m,
                     basis_bps=snap.basis_oi.basis_bps,
                     oi_change_5m=snap.basis_oi.oi_change_5m_pct,
-                    estimated_hold_minutes=45.0,
-                    expected_r=self.RR_RATIO,
+                    estimated_hold_minutes=20.0,
+                    expected_r=effective_r,
                     confidence=confidence,
                 )
             else:
@@ -565,8 +565,8 @@ class TrendMomentumV4:
                     cvd_5m=cvd.cvd_5m,
                     basis_bps=snap.basis_oi.basis_bps,
                     oi_change_5m=snap.basis_oi.oi_change_5m_pct,
-                    estimated_hold_minutes=45.0,
-                    expected_r=self.RR_RATIO,
+                    estimated_hold_minutes=20.0,
+                    expected_r=effective_r,
                     confidence=confidence,
                 )
             else:
