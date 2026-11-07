@@ -130,12 +130,16 @@ class TestExecutorExecution:
     async def test_on_fill_close_in_open_protected_calls_on_tp_sl_trigger(self):
         sm = ExecutorStateMachine()
         mock_exchange = MagicMock()
-        mock_exchange.cancel_all.return_value = {"status": "ok"}
+        mock_exchange.cancel.return_value = {"status": "ok"}
+        mock_exchange.bulk_cancel.return_value = {"status": "ok"}
+        mock_exchange.info.open_orders.return_value = [{"coin": "BTC", "oid": 555}]
 
         executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
         # Simular que ya está en OPEN_PROTECTED
         await sm.transition(ExecutorState.ENTRY_PENDING, "test")
         await sm.transition(ExecutorState.OPEN_PROTECTED, "test")
+        executor._active_sl_oid = 111
+        executor._active_tp_oid = 222
         executor._filled_size = 0.00136
 
         # Recibir fill de cierre
@@ -149,7 +153,9 @@ class TestExecutorExecution:
 
         # Debe transicionar a FLAT y cancelar órdenes de protección residuales
         assert sm.state == ExecutorState.FLAT
-        mock_exchange.cancel_all.assert_called_once_with("BTC")
+        mock_exchange.cancel.assert_any_call("BTC", 111)
+        mock_exchange.cancel.assert_any_call("BTC", 222)
+        mock_exchange.bulk_cancel.assert_called_once_with([{"coin": "BTC", "oid": 555}])
         # _filled_size debe haberse reiniciado a 0, NO sumado
         assert executor._filled_size == 0.0
 
@@ -157,18 +163,22 @@ class TestExecutorExecution:
     async def test_reconcile_state_cleans_up_when_position_zero(self):
         sm = ExecutorStateMachine()
         mock_exchange = MagicMock()
-        mock_exchange.cancel_all.return_value = {"status": "ok"}
+        mock_exchange.cancel.return_value = {"status": "ok"}
+        mock_exchange.bulk_cancel.return_value = {"status": "ok"}
+        mock_exchange.info.open_orders.return_value = [{"coin": "BTC", "oid": 666}]
 
         executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
         # Poner en OPEN_PROTECTED
         await sm.transition(ExecutorState.ENTRY_PENDING, "test")
         await sm.transition(ExecutorState.OPEN_PROTECTED, "test")
+        executor._active_sl_oid = 333
 
         # Reconciliación detecta que en el exchange la posición es 0.0
         await executor.reconcile_state(0.0)
 
         assert sm.state == ExecutorState.FLAT
-        mock_exchange.cancel_all.assert_called_once_with("BTC")
+        mock_exchange.cancel.assert_called_once_with("BTC", 333)
+        mock_exchange.bulk_cancel.assert_called_once_with([{"coin": "BTC", "oid": 666}])
 
     @pytest.mark.asyncio
     async def test_on_fill_deduplicates_entry_fill_from_ws(self):
@@ -197,3 +207,35 @@ class TestExecutorExecution:
 
         # Debe ignorarse: _filled_size NO debe duplicarse a 0.002
         assert executor._filled_size == 0.001
+
+    @pytest.mark.asyncio
+    async def test_manage_open_position_break_even_covers_fees(self):
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.order.return_value = {
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 999}}]}},
+        }
+        mock_exchange.cancel.return_value = {"status": "ok"}
+
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        approved = _make_sample_approved(OrderType.IOC)  # BUY @ 76000, SL=75500 (dist=500)
+        executor._active_order = approved
+        executor._filled_size = 0.001
+        executor._active_sl_oid = 123
+        await sm.transition(ExecutorState.ENTRY_PENDING, "test")
+        await sm.transition(ExecutorState.OPEN_PROTECTED, "test")
+
+        # Mock state con precio a +1.0R (mark_price = 76000 + 500 = 76500)
+        state = MagicMock()
+        state.account.position_entry_price = 76000.0
+        state.asset_ctx.mark_price = 76500.0
+
+        await executor.manage_open_position(state)
+
+        assert executor._moved_to_be is True
+        # be_price para LONG debe ser entry_price * 1.0010 = 76000 * 1.0010 = 76076.0
+        mock_exchange.order.assert_called_once()
+        args, kwargs = mock_exchange.order.call_args
+        placed_price = args[3]
+        assert placed_price == 76076.0

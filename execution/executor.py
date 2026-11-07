@@ -424,10 +424,7 @@ class HyperliquidExecutor:
 
         async with self._protect_lock:
             # Limpiar órdenes huérfanas previas antes de recolocar el par TP/SL limpio
-            try:
-                await asyncio.to_thread(self._exchange.cancel_all, self._symbol)
-            except Exception:
-                pass
+            await self._cancel_all_symbol_orders()
             await self._place_tp_sl_with_retry(entry_price, size, is_long_fallback=is_long_fallback)
 
     async def _place_tp_sl_with_retry(
@@ -563,7 +560,7 @@ class HyperliquidExecutor:
             fill_price,
         )
         try:
-            await asyncio.to_thread(self._exchange.cancel_all, self._symbol)
+            await self._cancel_all_symbol_orders()
             logger.info("Residual protection orders cancelled for %s", self._symbol)
         except Exception:
             logger.exception("Failed to cancel residual protection orders on TP/SL trigger")
@@ -660,7 +657,7 @@ class HyperliquidExecutor:
 
         try:
             # Cancelar todas las órdenes abiertas
-            await asyncio.to_thread(self._exchange.cancel_all, self._symbol)
+            await self._cancel_all_symbol_orders()
             logger.info("All orders cancelled")
 
             # Cerrar posición si existe
@@ -716,9 +713,9 @@ class HyperliquidExecutor:
         is_long = signal.side == SignalSide.BUY
         pnl_r = ((mark_price - entry_price) / sl_dist) if is_long else ((entry_price - mark_price) / sl_dist)
 
-        # ── Break-Even en +1.0R ───────────────────────────────────────────────
+        # ── Break-Even en +1.0R (offset 10 bps para cubrir comisiones Taker) ──
         if not self._moved_to_be and pnl_r >= 1.0 and self._can_modify_order():
-            be_price = entry_price * 1.0005 if is_long else entry_price * 0.9995
+            be_price = entry_price * 1.0010 if is_long else entry_price * 0.9990
             be_price = float(round(be_price)) if self._symbol == "BTC" else round(be_price, 2)
             logger.info(
                 "Break-Even activado: posición en +%.1fR. Moviendo SL a %.2f (entry=%.2f)",
@@ -783,6 +780,46 @@ class HyperliquidExecutor:
         # cuando llega un fill con el cloid correspondiente
         while self._active_entry_cloid == cloid:
             await asyncio.sleep(0.1)
+
+    async def _cancel_all_symbol_orders(self) -> None:
+        """
+        Cancela todas las órdenes del símbolo actual de manera segura:
+        1. Cancela las órdenes activas conocidas (SL y TP) vía self._exchange.cancel(self._symbol, int(oid)).
+        2. Consulta órdenes abiertas en el exchange vía self._exchange.info.open_orders(self._settings.hl_main_address)
+           y ejecuta self._exchange.bulk_cancel([{'coin': self._symbol, 'oid': int(o['oid'])} for o in open_orders if o.get('coin') == self._symbol]).
+        """
+        # 1. Cancelar órdenes activas conocidas (SL y TP)
+        for oid in (self._active_sl_oid, self._active_tp_oid):
+            if oid is not None:
+                try:
+                    await asyncio.to_thread(self._exchange.cancel, self._symbol, int(oid))
+                    logger.info("Cancelled active order %s (oid=%s)", self._symbol, oid)
+                except Exception as e:
+                    logger.debug("Error cancelling active order oid=%s: %s", oid, e)
+
+        # 2. Consultar open_orders y ejecutar bulk_cancel
+        try:
+            info_client = getattr(self._exchange, "info", None)
+            if info_client is None:
+                try:
+                    from hyperliquid.info import Info
+                    info_client = Info(self._settings.api_url, skip_ws=True)
+                except Exception:
+                    info_client = None
+
+            if info_client and hasattr(info_client, "open_orders"):
+                main_addr = self._settings.hl_main_address
+                open_orders = await asyncio.to_thread(info_client.open_orders, main_addr)
+                symbol_cancels = [
+                    {"coin": self._symbol, "oid": int(o["oid"])}
+                    for o in open_orders
+                    if isinstance(o, dict) and o.get("coin") == self._symbol and "oid" in o
+                ]
+                if symbol_cancels and hasattr(self._exchange, "bulk_cancel"):
+                    res = await asyncio.to_thread(self._exchange.bulk_cancel, symbol_cancels)
+                    logger.info("Bulk cancelled %d residual orders for %s: %s", len(symbol_cancels), self._symbol, res)
+        except Exception as e:
+            logger.debug("Error in bulk_cancel for %s: %s", self._symbol, e)
 
     async def _cancel_order(self, cloid: str) -> None:
         """Cancela una orden por cloid."""

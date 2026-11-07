@@ -364,11 +364,11 @@ class RiskValidator:
         v4: Máximo MAX_TRADES_PER_DAY trades por día calendario (UTC).
         Bloquea nuevas entradas si ya se alcanzó el límite.
         """
-        today = date.today().isoformat()
+        today_utc = datetime.now(timezone.utc).date().isoformat()
         try:
             async with self._db.execute(
                 "SELECT COUNT(*) FROM live_fills WHERE dir LIKE 'Open%' AND DATE(ts_ms/1000, 'unixepoch') = ?",
-                (today,),
+                (today_utc,),
             ) as cursor:
                 row = await cursor.fetchone()
                 count = row[0] if row else 0
@@ -376,7 +376,7 @@ class RiskValidator:
             if count >= self.MAX_TRADES_PER_DAY:
                 raise VetoException(
                     VetoReason.RISK_DAILY_LIMIT,
-                    f"Limite diario de trades: {count}/{self.MAX_TRADES_PER_DAY} hoy ({today}). "
+                    f"Limite diario de trades: {count}/{self.MAX_TRADES_PER_DAY} hoy ({today_utc}). "
                     f"Reactivando manana.",
                 )
         except VetoException:

@@ -684,6 +684,29 @@ class TestSmartMoneyFVGFilters:
         result = strat.evaluate(state, snap_no_atr, MarketRegime.RANGO)
         assert result is None
 
+    def test_dead_market_filter_blocks_signal(self):
+        """atr_5m < mid * 0.0008 (mercado muerto / baja volatilidad) → None."""
+        strat = SmartMoneyFVGReversal()
+        candles, _ = _build_bullish_fvg_scenario()
+        state = _make_state_with_candles(candles)
+
+        # mid = 80000 -> 80000 * 0.0008 = 64.0; pasar atr_5m = 40.0
+        snap_low_vol = _make_snap(atr_5m=40.0)
+        result = strat.evaluate(state, snap_low_vol, MarketRegime.RANGO)
+        assert result is None, "Debe bloquear señales cuando atr_5m < mid * 0.0008"
+
+    def test_sl_floor_satisfies_min_035_pct(self):
+        """El Stop Loss debe tener un piso de al menos 0.35% del precio (mid * 0.0035)."""
+        strat = SmartMoneyFVGReversal()
+        candles, snap = _build_bullish_fvg_scenario()
+        state = _make_state_with_candles(candles)
+
+        result = strat.evaluate(state, snap, MarketRegime.RANGO)
+        assert result is not None
+        sl_dist = abs(result.proposed_price - result.stop_loss)
+        min_allowed = result.proposed_price * 0.0035
+        assert sl_dist >= min_allowed, f"SL dist {sl_dist:.2f} < piso {min_allowed:.2f}"
+
 
 # ── Test de integración con RiskValidator ────────────────────────────────────
 

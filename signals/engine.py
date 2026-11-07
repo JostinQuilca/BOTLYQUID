@@ -178,6 +178,15 @@ class SmartMoneyFVGReversal:
         obi_val = snap.obi.value
         cvd_1m = snap.cvd.cvd_1m
 
+        # Filtro de mercado muerto: volatilidad mínima sana (menos de 8 bps / ~$60 en BTC)
+        if atr_5m < mid * 0.0008:
+            logger.debug(
+                "SmartMoneyFVG: bloqueado por baja volatilidad atr_5m=%.2f < min=%.2f",
+                atr_5m,
+                mid * 0.0008,
+            )
+            return None
+
         # ── C.1. Velas recientes (anti-repainting) ────────────────────────────
         candles = list(state.candles_1m)
         # Usar velas confirmadas (cerradas): si la última lleva < 55s desde su apertura
@@ -279,10 +288,11 @@ class SmartMoneyFVGReversal:
             orderflow_ok = cvd_1m > 0 and obi_val > self.OBI_MIN_THRESHOLD
 
             if price_in_fvg and structure_ok and orderflow_ok:
-                # Stop Loss
+                # Stop Loss (con piso mínimo de 0.35% del precio para resistir ruido)
+                min_sl_dist = max(0.8 * atr_5m, mid * 0.0035)
                 sl_price = min(c_now.low, fvg_bottom) - (0.5 * atr_5m)
-                if abs(mid - sl_price) < (0.8 * atr_5m):
-                    sl_price = mid - (0.8 * atr_5m)
+                if abs(mid - sl_price) < min_sl_dist:
+                    sl_price = mid - min_sl_dist
                 sl_dist = abs(mid - sl_price)
 
                 # Take Profit
@@ -336,10 +346,11 @@ class SmartMoneyFVGReversal:
             orderflow_ok = cvd_1m < 0 and obi_val < -self.OBI_MIN_THRESHOLD
 
             if price_in_fvg and structure_ok and orderflow_ok:
-                # Stop Loss
+                # Stop Loss (con piso mínimo de 0.35% del precio para resistir ruido)
+                min_sl_dist = max(0.8 * atr_5m, mid * 0.0035)
                 sl_price = max(c_now.high, fvg_top) + (0.5 * atr_5m)
-                if abs(sl_price - mid) < (0.8 * atr_5m):
-                    sl_price = mid + (0.8 * atr_5m)
+                if abs(sl_price - mid) < min_sl_dist:
+                    sl_price = mid + min_sl_dist
                 sl_dist = abs(sl_price - mid)
 
                 # Take Profit

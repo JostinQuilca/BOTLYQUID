@@ -285,3 +285,28 @@ class TestComputeSnapshot:
 
         assert elapsed_ms < 10.0, f"Snapshot tardó {elapsed_ms:.2f}ms (max 10ms)"
         assert snap.computed_at > 0
+
+
+class TestVolatilityTracker:
+
+    def test_atr_5m_groups_1m_candles(self):
+        """Calcula atr_5m agrupando velas de 1m en bloques de 5."""
+        state = MarketState()
+        now_ms = int(time.time() * 1000)
+        # Añadir 15 velas de 1m (3 bloques de 5m)
+        for i in range(15):
+            state.candles_1m.append(
+                Candle(
+                    timestamp_ms=now_ms + (i * 60_000),
+                    open=50000.0 + (i * 10.0),
+                    high=50020.0 + (i * 10.0),
+                    low=49990.0 + (i * 10.0),
+                    close=50010.0 + (i * 10.0),
+                    volume=5.0,
+                    interval="1m",
+                )
+            )
+        tracker = VolatilityTracker()
+        res = tracker.calculate(state)
+        assert res.atr_5m is not None
+        assert res.atr_5m > 0

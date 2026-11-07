@@ -311,7 +311,9 @@ class VolatilityTracker:
     def calculate(self, state: MarketState) -> VolatilityResult:
         price = state.l2_book.mid_price or state.asset_ctx.mark_price
 
-        atr_5m = self._atr(list(state.candles_1m)[-5:]) if len(state.candles_1m) >= 5 else None
+        # Velas reales de 5m (state.candles_5m si hay >= 5, o agrupando state.candles_1m en bloques de 5)
+        candles_5m = self._get_5m_candles(state)
+        atr_5m = self._atr(candles_5m[-14:]) if len(candles_5m) >= 2 else None
         atr_1h = self._atr(list(state.candles_1m)[-60:]) if len(state.candles_1m) >= 60 else None
 
         # FIX #2 fallback: si atr_1h no disponible todavía (< 60 velas), usar atr_5m
@@ -332,6 +334,38 @@ class VolatilityTracker:
             current_price=price or 0.0,
             computed_at=time.monotonic(),
         )
+
+    @staticmethod
+    def _get_5m_candles(state: MarketState) -> list[Any]:
+        """
+        Obtiene velas reales de 5m (state.candles_5m si hay >= 5)
+        o agrupa state.candles_1m en bloques completos de 5 velas.
+        """
+        if hasattr(state, "candles_5m") and len(state.candles_5m) >= 5:
+            return list(state.candles_5m)
+
+        candles_1m = list(state.candles_1m)
+        if len(candles_1m) < 5:
+            return []
+
+        from data.state import Candle
+        candles_5m: list[Candle] = []
+        n_blocks = len(candles_1m) // 5
+        start_idx = len(candles_1m) - (n_blocks * 5)
+        for b in range(n_blocks):
+            block = candles_1m[start_idx + b * 5 : start_idx + (b + 1) * 5]
+            candles_5m.append(
+                Candle(
+                    timestamp_ms=block[0].timestamp_ms,
+                    open=block[0].open,
+                    high=max(c.high for c in block),
+                    low=min(c.low for c in block),
+                    close=block[-1].close,
+                    volume=sum(c.volume for c in block),
+                    interval="5m",
+                )
+            )
+        return candles_5m
 
 
     @staticmethod
