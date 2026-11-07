@@ -689,10 +689,12 @@ class HyperliquidExecutor:
 
     async def manage_open_position(self, state: Any) -> None:
         """
-        Llamar cada 5s desde main.py mientras hay posición abierta.
-        1. Break-Even automático en +1.0R: mueve SL a precio de entrada.
-        2. Time-Stop: cierra si la posición lleva > 2.5x estimated_hold_minutes
-           y el PnL flotante está estancado (entre -0.3R y +0.5R).
+        Gestión activa cada 5s (v8 Scalp Blindado):
+        1. Break-Even temprano: apenas avanza +0.16% (~$120 en BTC) o +0.55R,
+           mueve el SL a +0.10% (cubre 100% de comisiones Taker y asegura ganancia).
+        2. Cierre en verde a los 8+ min (réplica del horizonte 5m-15m de Shadow Mode):
+           si lleva >= 8 min abierta y avanza >= +0.15% a favor, cobra ganancia a mercado.
+        3. Time-Stop a los 20 min si la operación queda estancada.
         """
         if self._sm.state != ExecutorState.OPEN_PROTECTED:
             return
@@ -711,18 +713,19 @@ class HyperliquidExecutor:
             return
 
         is_long = signal.side == SignalSide.BUY
+        move_pct = ((mark_price - entry_price) / entry_price) if is_long else ((entry_price - mark_price) / entry_price)
         pnl_r = ((mark_price - entry_price) / sl_dist) if is_long else ((entry_price - mark_price) / sl_dist)
+        elapsed_minutes = (time.monotonic() - self._entry_time) / 60.0
 
-        # ── Break-Even en +1.0R (offset 10 bps para cubrir comisiones Taker) ──
-        if not self._moved_to_be and pnl_r >= 1.0 and self._can_modify_order():
+        # ── 1. Break-Even Temprano (+0.16% de avance o +0.55R) ────────────────
+        if not self._moved_to_be and (move_pct >= 0.0016 or pnl_r >= 0.55) and self._can_modify_order():
             be_price = entry_price * 1.0010 if is_long else entry_price * 0.9990
             be_price = float(round(be_price)) if self._symbol == "BTC" else round(be_price, 2)
             logger.info(
-                "Break-Even activado: posición en +%.1fR. Moviendo SL a %.2f (entry=%.2f)",
-                pnl_r, be_price, entry_price,
+                "Break-Even temprano activado: move=%+.3f%% (+%.2fR). Moviendo SL a %.2f (entry=%.2f)",
+                move_pct * 100, pnl_r, be_price, entry_price,
             )
             try:
-                # Cancelar SL anterior y colocar nuevo SL en break-even
                 if self._active_sl_oid:
                     await asyncio.to_thread(
                         self._exchange.cancel, self._symbol, int(self._active_sl_oid)
@@ -745,31 +748,45 @@ class HyperliquidExecutor:
                 self._last_modify_at = time.monotonic()
                 if self._alerter:
                     await self._alerter.send(
-                        f"🔒 *BREAK-EVEN ACTIVADO*\n"
-                        f"Posición en `+{pnl_r:.1f}R`\n"
-                        f"SL movido a entrada: `${be_price:,.2f}`\n"
-                        f"Riesgo = 0 desde ahora.",
+                        f"🔒 *OPERACIÓN BLINDADA EN VERDE*\n"
+                        f"Avance: `{move_pct*100:+.2f}%` (`+{pnl_r:.2f}R`)\n"
+                        f"SL subido a ganancia: `${be_price:,.2f}`\n"
+                        f"Comisiones cubiertas — imposible perder en este trade.",
                         alert_type="INFO",
                     )
             except Exception:
-                logger.exception("Error aplicando break-even")
+                logger.exception("Error aplicando break-even temprano")
 
-        # ── Time-Stop ─────────────────────────────────────────────────────────
-        hold_minutes = signal.estimated_hold_minutes or 25.0
-        elapsed_minutes = (time.monotonic() - self._entry_time) / 60.0
-        if elapsed_minutes >= 2.5 * hold_minutes and -0.3 <= pnl_r <= 0.5:
-            logger.warning(
-                "Time-Stop activado: %.0f min elapsed (> 2.5x %.0f min hold), PnL=%.2fR. Cerrando.",
-                elapsed_minutes, hold_minutes, pnl_r,
+        # ── 2. Cobro Rápido en Verde (Horizonte 8–15 min como Shadow Mode) ────
+        if elapsed_minutes >= 8.0 and move_pct >= 0.0015:
+            logger.info(
+                "Scalp Profit Exit: %.1f min abierta con ganancia %+.3f%%. Cerrando en verde a mercado.",
+                elapsed_minutes, move_pct * 100,
             )
             if self._alerter:
                 await self._alerter.send(
-                    f"⏱ *TIME-STOP EJECUTADO*\n"
-                    f"Posición abierta `{elapsed_minutes:.0f}min` (límite: `{2.5*hold_minutes:.0f}min`)\n"
-                    f"PnL flotante: `{pnl_r:+.2f}R` — operación estancada.\n"
-                    f"Cerrando a mercado...",
+                    f"🎯 *GANANCIA RÁPIDA ASEGURADA (SCALP EXIT)*\n"
+                    f"Tiempo: `{elapsed_minutes:.1f} min` | Avance: `{move_pct*100:+.2f}%`\n"
+                    f"Cerrando a mercado en `${mark_price:,.2f}` para asegurar beneficio neto.",
+                    alert_type="FILL",
+                )
+            await self._cancel_all_symbol_orders()
+            await self._emergency_close(self._filled_size, "Scalp Profit Exit in green")
+            return
+
+        # ── 3. Time-Stop (20 minutos estancada) ───────────────────────────────
+        if elapsed_minutes >= 20.0 and -0.25 <= pnl_r <= 0.40:
+            logger.warning(
+                "Time-Stop activado: %.0f min elapsed, PnL=%.2fR. Cerrando.",
+                elapsed_minutes, pnl_r,
+            )
+            if self._alerter:
+                await self._alerter.send(
+                    f"⏱ *TIME-STOP EJECUTADO (20m)*\n"
+                    f"Posición sin impulso (`{pnl_r:+.2f}R`). Cerrando a mercado...",
                     alert_type="WARNING",
                 )
+            await self._cancel_all_symbol_orders()
             await self._emergency_close(self._filled_size, "Time-Stop: posición estancada")
 
     # ── Helpers ────────────────────────────────────────────────────────────────

@@ -233,9 +233,9 @@ class TestAccountLimits:
 
     @pytest.mark.asyncio
     async def test_existing_position_vetoed(self, mock_db):
-        """Segunda posiciÃ³n debe ser vetada (mÃ¡ximo 1 posiciÃ³n)."""
+        """Segunda posición debe ser vetada (máximo 1 posición)."""
         state = make_healthy_state()
-        state.account.position_size = 0.001  # Ya hay una posiciÃ³n abierta
+        state.account.position_size = 0.001  # Ya hay una posición abierta
 
         validator = RiskValidator(mock_db, settings=make_test_settings())
 
@@ -243,6 +243,29 @@ class TestAccountLimits:
             await validator.validate(make_valid_signal(), state)
 
         assert exc_info.value.reason.value == "RISK_MAX_POSITION"
+
+    @pytest.mark.asyncio
+    async def test_capital_floor_protects_capital(self, mock_db):
+        """Si equity < 41.00 USDC con cuenta real (open >= 41), se activa candado de capital."""
+        state = make_healthy_state(equity=40.50)
+        today = date.today().isoformat()
+        await mock_db.execute(
+            """
+            INSERT INTO daily_risk
+            (date_utc, equity_open, equity_peak, realized_pnl, unrealized_pnl)
+            VALUES (?, 45.0, 45.0, -4.5, 0)
+            """,
+            (today,),
+        )
+        await mock_db.commit()
+
+        validator = RiskValidator(mock_db, settings=make_test_settings())
+
+        with pytest.raises(VetoException) as exc_info:
+            await validator.validate(make_valid_signal(), state, shadow_mode=False)
+
+        assert exc_info.value.reason.value == "KILL_SWITCH_ACTIVE"
+        assert validator._kill_switch_active
 
 
 # â”€â”€ Tests de Dimensionamiento â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

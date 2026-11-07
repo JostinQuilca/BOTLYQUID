@@ -522,7 +522,7 @@ class TestSmartMoneyFVGLong:
         assert result.order_type == OrderType.IOC, "SmartMoneyFVG debe usar IOC para ejecución inmediata"
         assert result.stop_loss < result.proposed_price, "SL debe estar debajo del precio"
         assert result.take_profit > result.proposed_price, "TP debe estar encima del precio"
-        assert result.expected_r >= 2.2, "R:R mínimo 2.2:1"
+        assert result.expected_r >= 1.25, "R:R mínimo 1.25:1"
         assert result.confidence > 0.0
 
     def test_bullish_sl_distance_floor(self):
@@ -578,7 +578,7 @@ class TestSmartMoneyFVGShort:
         assert result.order_type == OrderType.IOC, "SmartMoneyFVG debe usar IOC para ejecución inmediata"
         assert result.stop_loss > result.proposed_price, "SL debe estar encima del precio"
         assert result.take_profit < result.proposed_price, "TP debe estar debajo del precio"
-        assert result.expected_r >= 2.2
+        assert result.expected_r >= 1.25
 
     def test_bearish_sl_distance_floor(self):
         """El SL distance debe ser al menos 0.8 * atr_5m (SHORT)."""
@@ -696,7 +696,7 @@ class TestSmartMoneyFVGFilters:
         assert result is None, "Debe bloquear señales cuando atr_5m < mid * 0.0008"
 
     def test_sl_floor_satisfies_min_035_pct(self):
-        """El Stop Loss debe tener un piso de al menos 0.35% del precio (mid * 0.0035)."""
+        """El Stop Loss debe tener un piso de al menos 0.25% del precio (mid * 0.0025)."""
         strat = SmartMoneyFVGReversal()
         candles, snap = _build_bullish_fvg_scenario()
         state = _make_state_with_candles(candles)
@@ -704,7 +704,7 @@ class TestSmartMoneyFVGFilters:
         result = strat.evaluate(state, snap, MarketRegime.RANGO)
         assert result is not None
         sl_dist = abs(result.proposed_price - result.stop_loss)
-        min_allowed = result.proposed_price * 0.0035
+        min_allowed = result.proposed_price * 0.0025
         assert sl_dist >= min_allowed, f"SL dist {sl_dist:.2f} < piso {min_allowed:.2f}"
 
 

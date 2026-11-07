@@ -290,6 +290,16 @@ class RiskValidator:
         )
 
     async def _check_account_limits(self, risk_state: RiskState, state: MarketState) -> None:
+        # Candado duro de protección de capital ($41.00 USDC)
+        if not self._shadow_mode and risk_state.equity_open >= 41.00 and 0 < state.account.equity < 41.00:
+            self.activate_kill_switch(
+                f"Capital floor reached: ${state.account.equity:.2f} < $41.00 USDC"
+            )
+            raise VetoException(
+                VetoReason.KILL_SWITCH_ACTIVE,
+                f"Candado de capital activado (${state.account.equity:.2f} < $41.00 USDC) — capital protegido",
+            )
+
         # Kill switch permanente en BD (sobrevive reinicios)
         if risk_state.kill_switch:
             self.activate_kill_switch("Permanent kill switch from DB (max drawdown exceeded)")

@@ -266,7 +266,6 @@ class SmartMoneyFVGReversal:
         hour_utc = now_utc.hour + now_utc.minute / 60.0
         in_ny_killzone = 13.5 <= hour_utc < 17.0
 
-        expected_r = 2.5 if in_ny_killzone else 2.2
         kz_confidence_bonus = 0.08 if in_ny_killzone else 0.0
 
         # ── D. Señal LONG ─────────────────────────────────────────────────────
@@ -288,15 +287,17 @@ class SmartMoneyFVGReversal:
             orderflow_ok = cvd_1m > 0 and obi_val > self.OBI_MIN_THRESHOLD
 
             if price_in_fvg and structure_ok and orderflow_ok:
-                # Stop Loss (con piso mínimo de 0.35% del precio para resistir ruido)
-                min_sl_dist = max(0.8 * atr_5m, mid * 0.0035)
-                sl_price = min(c_now.low, fvg_bottom) - (0.5 * atr_5m)
-                if abs(mid - sl_price) < min_sl_dist:
-                    sl_price = mid - min_sl_dist
-                sl_dist = abs(mid - sl_price)
+                # Stop Loss calibrado (piso 0.25% ~ $190, techo 0.35% ~ $265)
+                min_sl_dist = max(0.8 * atr_5m, mid * 0.0025)
+                max_sl_dist = mid * 0.0035
+                raw_sl_dist = abs(mid - (min(c_now.low, fvg_bottom) - (0.3 * atr_5m)))
+                sl_dist = max(min_sl_dist, min(raw_sl_dist, max_sl_dist))
+                sl_price = mid - sl_dist
 
-                # Take Profit
-                tp_price = mid + (sl_dist * expected_r)
+                # Take Profit corto de alta tasa de acierto (mínimo 0.32% ~ $245 en BTC)
+                tp_dist = max(sl_dist * 1.3, mid * 0.0032)
+                tp_price = mid + tp_dist
+                effective_r = round(tp_dist / sl_dist, 2)
 
                 confidence = round(
                     min(0.72 + kz_confidence_bonus + min(obi_val / 0.5, 0.15), 0.95),
@@ -306,7 +307,7 @@ class SmartMoneyFVGReversal:
                 logger.info(
                     "SmartMoneyFVG LONG: FVG(%.1f-%.1f) engulf=True mid=%.1f "
                     "SL=%.1f TP=%.1f R:R=%.1f KZ=%s conf=%.2f",
-                    fvg_bottom, fvg_top, mid, sl_price, tp_price, expected_r,
+                    fvg_bottom, fvg_top, mid, sl_price, tp_price, effective_r,
                     in_ny_killzone, confidence,
                 )
                 return SignalProposal(
@@ -322,8 +323,8 @@ class SmartMoneyFVGReversal:
                     cvd_5m=snap.cvd.cvd_5m,
                     basis_bps=snap.basis_oi.basis_bps,
                     oi_change_5m=snap.basis_oi.oi_change_5m_pct,
-                    estimated_hold_minutes=25.0,
-                    expected_r=expected_r,
+                    estimated_hold_minutes=15.0,
+                    expected_r=effective_r,
                     confidence=confidence,
                 )
 
@@ -346,15 +347,17 @@ class SmartMoneyFVGReversal:
             orderflow_ok = cvd_1m < 0 and obi_val < -self.OBI_MIN_THRESHOLD
 
             if price_in_fvg and structure_ok and orderflow_ok:
-                # Stop Loss (con piso mínimo de 0.35% del precio para resistir ruido)
-                min_sl_dist = max(0.8 * atr_5m, mid * 0.0035)
-                sl_price = max(c_now.high, fvg_top) + (0.5 * atr_5m)
-                if abs(sl_price - mid) < min_sl_dist:
-                    sl_price = mid + min_sl_dist
-                sl_dist = abs(sl_price - mid)
+                # Stop Loss calibrado (piso 0.25% ~ $190, techo 0.35% ~ $265)
+                min_sl_dist = max(0.8 * atr_5m, mid * 0.0025)
+                max_sl_dist = mid * 0.0035
+                raw_sl_dist = abs((max(c_now.high, fvg_top) + (0.3 * atr_5m)) - mid)
+                sl_dist = max(min_sl_dist, min(raw_sl_dist, max_sl_dist))
+                sl_price = mid + sl_dist
 
-                # Take Profit
-                tp_price = mid - (sl_dist * expected_r)
+                # Take Profit corto de alta tasa de acierto (mínimo 0.32% ~ $245 en BTC)
+                tp_dist = max(sl_dist * 1.3, mid * 0.0032)
+                tp_price = mid - tp_dist
+                effective_r = round(tp_dist / sl_dist, 2)
 
                 confidence = round(
                     min(0.72 + kz_confidence_bonus + min(abs(obi_val) / 0.5, 0.15), 0.95),
@@ -364,7 +367,7 @@ class SmartMoneyFVGReversal:
                 logger.info(
                     "SmartMoneyFVG SHORT: FVG(%.1f-%.1f) engulf=True mid=%.1f "
                     "SL=%.1f TP=%.1f R:R=%.1f KZ=%s conf=%.2f",
-                    fvg_bottom, fvg_top, mid, sl_price, tp_price, expected_r,
+                    fvg_bottom, fvg_top, mid, sl_price, tp_price, effective_r,
                     in_ny_killzone, confidence,
                 )
                 return SignalProposal(
@@ -380,8 +383,8 @@ class SmartMoneyFVGReversal:
                     cvd_5m=snap.cvd.cvd_5m,
                     basis_bps=snap.basis_oi.basis_bps,
                     oi_change_5m=snap.basis_oi.oi_change_5m_pct,
-                    estimated_hold_minutes=25.0,
-                    expected_r=expected_r,
+                    estimated_hold_minutes=15.0,
+                    expected_r=effective_r,
                     confidence=confidence,
                 )
 
