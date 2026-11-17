@@ -1,12 +1,12 @@
 """
 backtest_kronos_hl.py
 =====================
-Walk-Forward Backtest de KronosFoundationStrategy sobre BTC en Hyperliquid Mainnet (Plan v13).
+Walk-Forward Backtest de KronosFoundationStrategy sobre BTC en Hyperliquid Mainnet (Plan v14).
 Descarga las últimas 400 velas de 5m y 15m directamente de Hyperliquid.
 Simula ejecución realista con:
 - Capital inicial: $42.85 USDC (Apalancamiento 2x -> $85.70 USD nocionales)
 - Lookback: 256 velas, Pred_len: 6 velas, Sample_count: 4
-- Consenso Kronos: >= 75% (con protección de trayectoria temprana vela 1-2) y retorno proyectado >= +0.36%
+- Consenso Kronos: >= 75% (con protección de trayectoria temprana vela 1-2) y retorno proyectado >= +0.28% (5m) / +0.35% (15m)
 - Confirmación de tendencia EMA 20 (last_close >= ema20 para LONG, last_close <= ema20 para SHORT)
 - SL: 0.25%
 - TP: max(0.44%, min(abs(proj_ret) * 1.15, 0.60%))
@@ -144,10 +144,11 @@ def run_walkforward_backtest(
         proj_ret = (mean_end_close - last_close) / last_close
         ema20 = float(df_window["close"].ewm(span=20, adjust=False).mean().iloc[-1])
 
+        min_proj_ret = 0.0028 if interval == "5m" else 0.0035
         signal_side = None
-        if bull_ratio >= 0.75 and proj_ret >= 0.0036 and last_close >= ema20:
+        if bull_ratio >= 0.75 and proj_ret >= min_proj_ret and last_close >= ema20:
             signal_side = "LONG"
-        elif bear_ratio >= 0.75 and -proj_ret >= 0.0036 and last_close <= ema20:
+        elif bear_ratio >= 0.75 and -proj_ret >= min_proj_ret and last_close <= ema20:
             signal_side = "SHORT"
 
         if signal_side is None:

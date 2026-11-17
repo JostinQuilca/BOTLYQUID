@@ -621,20 +621,18 @@ class TrendMomentumV4:
 
 class KronosFoundationStrategy:
     """
-    Estrategia basada en el Modelo Fundacional de K-lines Kronos (Plan v13).
-    - Utiliza NeoQuasar/Kronos-mini y NeoQuasar/Kronos-Tokenizer-2k.
-    - Se evalúa únicamente una vez por cada cierre de vela de 5 minutos (evitando sobrecarga de CPU).
-    - Requiere consenso probabilístico >= 75% (al menos 3 de 4 trayectorias con protección temprana).
-    - Exige proyección de retorno >= +0.36% y alineación de tendencia con EMA20 de 5m.
-    - Filtro de seguridad del Orderbook: rechaza la señal si hay un muro adverso (OBI > 0.65 en contra).
-    - SL calibrado en 0.25%, TP calibrado entre 0.44% y 0.60% (R:R neto positivo post-comisiones).
+    Estrategia basada en el Modelo Fundacional de K-lines Kronos (Plan v14 Dual 15m + 5m).
+    - Motor principal en 15m (horizonte 90m): consenso >= 75%, retorno proyectado >= 0.35% + EMA20.
+    - Motor táctico en 5m (horizonte 30m): consenso >= 75%, retorno proyectado >= 0.28% + EMA20.
+    - SL calibrado en 0.25%, TP entre 0.44% y 0.60% (R:R neto positivo tras 0.0864% Taker fee).
     """
 
     def __init__(self) -> None:
         self.name = "KronosFoundationStrategy"
         self._predictor: Any | None = None
         self._model_failed: bool = False
-        self._last_evaluated_candle_ts: int = 0
+        self._last_evaluated_5m_ts: int = 0
+        self._last_evaluated_15m_ts: int = 0
         self._lookback = 256
         self._pred_len = 6
         self._sample_count = 4
@@ -661,30 +659,23 @@ class KronosFoundationStrategy:
             self._model_failed = True
             return None
 
-    def evaluate(
+    def _evaluate_timeframe(
         self,
+        candles_deque: Any,
+        freq_str: str,
+        step_minutes: int,
+        min_proj_ret: float,
+        hold_minutes: float,
         state: MarketState,
         snap: MicrostructureSnapshot,
         regime: MarketRegime,
     ) -> SignalProposal | None:
-        # Necesitamos al menos 256 velas cerradas + 1 vela actual en formación
-        if len(state.candles_5m) < self._lookback + 1:
-            return None
-
-        # Evaluar únicamente UNA VEZ cuando abre un nuevo bloque de 5 minutos
-        current_forming_candle = state.candles_5m[-1]
-        if current_forming_candle.timestamp_ms == self._last_evaluated_candle_ts:
-            return None
-
         predictor = self._get_predictor()
         if predictor is None:
             return None
 
-        self._last_evaluated_candle_ts = current_forming_candle.timestamp_ms
-
         import pandas as pd
-        # Tomar las 256 velas de 5m CERRADAS (excluyendo la actual en formación)
-        candles = list(state.candles_5m)[-(self._lookback + 1):-1]
+        candles = list(candles_deque)[-(self._lookback + 1):-1]
         df = pd.DataFrame([
             {
                 "open": c.open,
@@ -699,7 +690,7 @@ class KronosFoundationStrategy:
         x_timestamps = pd.Series(pd.to_datetime([c.timestamp_ms for c in candles], unit="ms"))
         last_ts = x_timestamps.iloc[-1]
         y_timestamps = pd.Series(
-            pd.date_range(last_ts + pd.Timedelta(minutes=5), periods=self._pred_len, freq="5min")
+            pd.date_range(last_ts + pd.Timedelta(minutes=step_minutes), periods=self._pred_len, freq=freq_str)
         )
 
         try:
@@ -713,7 +704,7 @@ class KronosFoundationStrategy:
                 sample_count=self._sample_count,
             )
         except Exception:
-            logger.exception("Error durante inferencia Kronos")
+            logger.exception("Error durante inferencia Kronos (%s)", freq_str)
             return None
 
         last_close = float(df["close"].iloc[-1])
@@ -727,30 +718,28 @@ class KronosFoundationStrategy:
         is_short = False
         confidence = 0.0
 
-        if bull_ratio >= 0.75 and proj_ret >= 0.0036 and (ema_20 is None or last_close >= ema_20):
+        if bull_ratio >= 0.75 and proj_ret >= min_proj_ret and (ema_20 is None or last_close >= ema_20):
             is_long = True
             confidence = bull_ratio
-        elif bear_ratio >= 0.75 and -proj_ret >= 0.0036 and (ema_20 is None or last_close <= ema_20):
+        elif bear_ratio >= 0.75 and -proj_ret >= min_proj_ret and (ema_20 is None or last_close <= ema_20):
             is_short = True
             confidence = bear_ratio
         else:
             return None
 
-        # Filtro de seguridad del Orderbook (rechaza si hay muro adverso en contra)
         obi_val = snap.obi.value if snap.obi is not None else 0.0
         if snap.obi is not None:
             if is_long and obi_val < -0.65:
-                logger.info("Kronos BUY vetado por muro institucional de venta (OBI=%.2f < -0.65)", obi_val)
+                logger.info("Kronos BUY (%s) vetado por muro de venta (OBI=%.2f)", freq_str, obi_val)
                 return None
             if is_short and obi_val > 0.65:
-                logger.info("Kronos SELL vetado por muro institucional de compra (OBI=%.2f > +0.65)", obi_val)
+                logger.info("Kronos SELL (%s) vetado por muro de compra (OBI=%.2f)", freq_str, obi_val)
                 return None
 
         mid = (state.l2_book.mid_price if state.l2_book else None) or last_close
         if mid <= 0:
             return None
 
-        # Calibración SL (0.25%) y TP (0.44% - 0.60%) para R:R neto > 1.05:1 tras fees Taker (0.0864%)
         sl_dist = mid * 0.0025
         target_ret = abs(proj_ret)
         tp_dist = mid * max(0.0044, min(target_ret * 1.15, 0.0060))
@@ -767,8 +756,8 @@ class KronosFoundationStrategy:
         effective_r = round(tp_dist / sl_dist, 2)
 
         logger.info(
-            "KronosFoundationStrategy señal: %s @ %.2f | bull=%.2f bear=%.2f ret=%+.3f%% | SL=%.2f TP=%.2f (R=%.2f)",
-            side.value, mid, bull_ratio, bear_ratio, proj_ret * 100, sl_price, tp_price, effective_r,
+            "KronosFoundationStrategy (%s) señal: %s @ %.2f | bull=%.2f bear=%.2f ret=%+.3f%% | SL=%.2f TP=%.2f (R=%.2f)",
+            freq_str, side.value, mid, bull_ratio, bear_ratio, proj_ret * 100, sl_price, tp_price, effective_r,
         )
 
         return SignalProposal(
@@ -784,10 +773,52 @@ class KronosFoundationStrategy:
             cvd_5m=snap.cvd.cvd_5m if snap.cvd else 0.0,
             basis_bps=snap.basis_oi.basis_bps,
             oi_change_5m=snap.basis_oi.oi_change_5m_pct,
-            estimated_hold_minutes=30.0,
+            estimated_hold_minutes=hold_minutes,
             expected_r=effective_r,
             confidence=round(confidence, 2),
         )
+
+    def evaluate(
+        self,
+        state: MarketState,
+        snap: MicrostructureSnapshot,
+        regime: MarketRegime,
+    ) -> SignalProposal | None:
+        # 1. Prioridad: evaluar cierre de vela de 15m (horizonte 90m, min_proj_ret=0.35%)
+        if hasattr(state, "candles_15m") and len(state.candles_15m) >= self._lookback + 1:
+            curr_15m = state.candles_15m[-1]
+            if curr_15m.timestamp_ms != self._last_evaluated_15m_ts:
+                self._last_evaluated_15m_ts = curr_15m.timestamp_ms
+                sig_15m = self._evaluate_timeframe(
+                    candles_deque=state.candles_15m,
+                    freq_str="15min",
+                    step_minutes=15,
+                    min_proj_ret=0.0035,
+                    hold_minutes=90.0,
+                    state=state,
+                    snap=snap,
+                    regime=regime,
+                )
+                if sig_15m is not None:
+                    return sig_15m
+
+        # 2. Secundario: evaluar cierre de vela de 5m (horizonte 30m, min_proj_ret=0.28%)
+        if len(state.candles_5m) >= self._lookback + 1:
+            curr_5m = state.candles_5m[-1]
+            if curr_5m.timestamp_ms != self._last_evaluated_5m_ts:
+                self._last_evaluated_5m_ts = curr_5m.timestamp_ms
+                return self._evaluate_timeframe(
+                    candles_deque=state.candles_5m,
+                    freq_str="5min",
+                    step_minutes=5,
+                    min_proj_ret=0.0028,
+                    hold_minutes=30.0,
+                    state=state,
+                    snap=snap,
+                    regime=regime,
+                )
+
+        return None
 
 
 # ── Motor de Decisiones Principal v4 ──────────────────────────────────────────

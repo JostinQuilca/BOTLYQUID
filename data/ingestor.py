@@ -261,6 +261,27 @@ class HyperliquidIngestor:
             else:
                 self._state.candles_5m.append(c5)
 
+        # Actualizar vela de 15m correspondiente (bucket de 900_000 ms)
+        bucket_15m_ts = (candle.timestamp_ms // 900_000) * 900_000
+        candles_in_15m = [
+            c for c in self._state.candles_1m
+            if (c.timestamp_ms // 900_000) * 900_000 == bucket_15m_ts
+        ]
+        if candles_in_15m:
+            c15 = Candle(
+                timestamp_ms=bucket_15m_ts,
+                open=candles_in_15m[0].open,
+                high=max(c.high for c in candles_in_15m),
+                low=min(c.low for c in candles_in_15m),
+                close=candles_in_15m[-1].close,
+                volume=sum(c.volume for c in candles_in_15m),
+                interval="15m",
+            )
+            if self._state.candles_15m and self._state.candles_15m[-1].timestamp_ms == bucket_15m_ts:
+                self._state.candles_15m[-1] = c15
+            else:
+                self._state.candles_15m.append(c15)
+
         # Persistir en BD via Cola (Cold Path)
         self._db_worker._queue.put_nowait(DBEvent(
             table="candles_1m",

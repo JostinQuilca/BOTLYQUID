@@ -141,6 +141,38 @@ async def main() -> None:
                     "Precargadas %d velas de 5m desde Hyperliquid REST (Kronos listo al instante)",
                     len(market_state.candles_5m),
                 )
+
+            start_15m_ms = now_ms - (280 * 15 * 60 * 1000)
+            _resp_15m = await _client.post(
+                "https://api.hyperliquid.xyz/info",
+                json={
+                    "type": "candleSnapshot",
+                    "req": {
+                        "coin": settings.trading_symbol,
+                        "interval": "15m",
+                        "startTime": start_15m_ms,
+                        "endTime": now_ms,
+                    },
+                },
+            )
+            if _resp_15m.status_code == 200 and isinstance(_resp_15m.json(), list):
+                raw_15m = sorted(_resp_15m.json(), key=lambda c: c["t"])
+                for c in raw_15m[-280:]:
+                    market_state.candles_15m.append(
+                        _Candle5m(
+                            timestamp_ms=int(c["t"]),
+                            open=float(c["o"]),
+                            high=float(c["h"]),
+                            low=float(c["l"]),
+                            close=float(c["c"]),
+                            volume=float(c["v"]),
+                            interval="15m",
+                        )
+                    )
+                logger.info(
+                    "Precargadas %d velas de 15m desde Hyperliquid REST",
+                    len(market_state.candles_15m),
+                )
     except Exception:
         logger.exception("Error precargando velas de 5m desde Hyperliquid REST (no crítico)")
 

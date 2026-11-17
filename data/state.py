@@ -136,6 +136,9 @@ class MarketState:
         # ── Velas 5m (últimas 288 = 24 horas) ────────────────────────────────
         self.candles_5m: deque[Candle] = deque(maxlen=288)
 
+        # ── Velas 15m (últimas 288 = 72 horas) ───────────────────────────────
+        self.candles_15m: deque[Candle] = deque(maxlen=288)
+
         # ── Estado de la cuenta ───────────────────────────────────────────────
         self.account: AccountState = AccountState()
 

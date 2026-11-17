@@ -1,5 +1,6 @@
 app = 'damian-portilla'
 primary_region = 'iad'
+swap_size_mb = 512
 
 [build]
 
@@ -14,3 +15,8 @@ primary_region = 'iad'
   auto_start_machines = true
   min_machines_running = 1
   processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1

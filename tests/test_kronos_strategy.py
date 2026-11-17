@@ -215,3 +215,41 @@ def test_decision_engine_exclusive_when_use_kronos(monkeypatch):
     strat_names = [type(s).__name__ for s in engine_old._strategies]
     assert "SmartMoneyFVGReversal" in strat_names
     assert "TrendMomentumV4" in strat_names
+
+
+def test_kronos_dual_15m_priority_and_5m_fallback():
+    strat = KronosFoundationStrategy()
+    state = _make_state_with_5m_candles(n=260, trend="up")
+    base_ts = 1700000000000
+    for i in range(260):
+        ts = base_ts + i * 900000
+        state.candles_15m.append(
+            Candle(
+                timestamp_ms=ts,
+                open=70000.0 + i,
+                high=70050.0 + i,
+                low=69950.0 + i,
+                close=70020.0 + i,
+                volume=30.0,
+                interval="15m",
+            )
+        )
+    snap = _make_snapshot(obi_val=0.2)
+
+    mock_pred = MagicMock()
+    mock_pred.predict_ensemble.return_value = {
+        "mean_df": pd.DataFrame({"close": [70400.0, 70500.0, 70600.0, 70700.0, 70800.0, 71000.0]}),
+        "bull_ratio": 1.0,
+        "bear_ratio": 0.0,
+    }
+    strat._predictor = mock_pred
+
+    # 1. Primera llamada debe priorizar 15m (hold_minutes = 90.0)
+    sig_15m = strat.evaluate(state, snap, MarketRegime.RANGO)
+    assert sig_15m is not None
+    assert sig_15m.estimated_hold_minutes == 90.0
+
+    # 2. Segunda llamada en el mismo bloque de 15m debe caer al cierre de 5m (hold_minutes = 30.0)
+    sig_5m = strat.evaluate(state, snap, MarketRegime.RANGO)
+    assert sig_5m is not None
+    assert sig_5m.estimated_hold_minutes == 30.0
