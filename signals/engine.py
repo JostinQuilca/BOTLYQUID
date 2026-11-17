@@ -28,9 +28,10 @@ CAMBIOS v4 (modo conservador):
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from data.state import MarketState
 from microstructure.metrics import MicrostructureSnapshot, compute_snapshot
@@ -616,37 +617,201 @@ class TrendMomentumV4:
         return round(ema_score + rsi_score + obi_score + cvd_score, 3)
 
 
-# ── Estrategias desactivadas (PENDIENTES DE BACKTEST) ─────────────────────────
-# AbsorptionMeanReversion → win rate demasiado bajo en live
-# VolatilityBreakout → muchos falsos breakouts en rango lateral
-# StopHuntReversal → pocos datos live para validar
+# ── Kronos Foundation Strategy (Plan v10) ────────────────────────────────────
+
+class KronosFoundationStrategy:
+    """
+    Estrategia basada en el Modelo Fundacional de K-lines Kronos (Plan v10).
+    - Utiliza NeoQuasar/Kronos-mini y NeoQuasar/Kronos-Tokenizer-2k.
+    - Se evalúa únicamente una vez por cada cierre de vela de 5 minutos (evitando sobrecarga de CPU).
+    - Requiere consenso probabilístico >= 80% (al menos 4 de 5 trayectorias).
+    - Exige proyección de retorno que supere el 0.0864% de comisiones Taker (mínimo +0.32%).
+    - Filtro de seguridad del Orderbook: rechaza la señal si hay un muro adverso (OBI > 0.65 en contra).
+    - SL calibrado entre 0.25% y 0.35%, TP calibrado entre 0.35% y 0.55%.
+    """
+
+    def __init__(self) -> None:
+        self.name = "KronosFoundationStrategy"
+        self._predictor: Any | None = None
+        self._model_failed: bool = False
+        self._last_evaluated_candle_ts: int = 0
+        self._lookback = 256
+        self._pred_len = 6
+        self._sample_count = 5
+        self._temperature = 0.6
+        self._top_p = 0.9
+
+    def _get_predictor(self) -> Any | None:
+        if self._predictor is not None:
+            return self._predictor
+        if self._model_failed:
+            return None
+        try:
+            import torch
+            from kronos_engine import Kronos, KronosTokenizer, KronosPredictor
+            logger.info("Cargando modelo Kronos-mini para KronosFoundationStrategy...")
+            tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-2k")
+            model = Kronos.from_pretrained("NeoQuasar/Kronos-mini")
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            self._predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
+            logger.info("KronosFoundationStrategy inicializada en %s", device)
+            return self._predictor
+        except Exception:
+            logger.exception("Error al inicializar KronosPredictor")
+            self._model_failed = True
+            return None
+
+    def evaluate(
+        self,
+        state: MarketState,
+        snap: MicrostructureSnapshot,
+        regime: MarketRegime,
+    ) -> SignalProposal | None:
+        if len(state.candles_5m) < self._lookback:
+            return None
+
+        # Evaluar únicamente UNA VEZ por cada cierre de vela de 5 minutos
+        last_candle = state.candles_5m[-1]
+        if last_candle.timestamp_ms == self._last_evaluated_candle_ts:
+            return None
+
+        predictor = self._get_predictor()
+        if predictor is None:
+            return None
+
+        self._last_evaluated_candle_ts = last_candle.timestamp_ms
+
+        import pandas as pd
+        candles = list(state.candles_5m)[-self._lookback:]
+        df = pd.DataFrame([
+            {
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+                "volume": c.volume,
+                "amount": c.volume * c.close,
+            }
+            for c in candles
+        ])
+        x_timestamps = pd.Series(pd.to_datetime([c.timestamp_ms for c in candles], unit="ms"))
+        last_ts = x_timestamps.iloc[-1]
+        y_timestamps = pd.Series(pd.date_range(last_ts + pd.Timedelta(minutes=5), periods=self._pred_len, freq="5min"))
+
+        try:
+            pred_res = predictor.predict_ensemble(
+                df=df,
+                x_timestamp=x_timestamps,
+                y_timestamp=y_timestamps,
+                pred_len=self._pred_len,
+                T=self._temperature,
+                top_p=self._top_p,
+                sample_count=self._sample_count,
+            )
+        except Exception:
+            logger.exception("Error durante inferencia Kronos")
+            return None
+
+        last_close = float(df["close"].iloc[-1])
+        mean_end_close = float(pred_res["mean_df"]["close"].iloc[-1])
+        proj_ret = (mean_end_close - last_close) / last_close
+        bull_ratio = pred_res["bull_ratio"]
+        bear_ratio = pred_res["bear_ratio"]
+
+        is_long = False
+        is_short = False
+        confidence = 0.0
+
+        if bull_ratio >= 0.80 and proj_ret >= 0.0032:
+            is_long = True
+            confidence = bull_ratio
+        elif bear_ratio >= 0.80 and -proj_ret >= 0.0032:
+            is_short = True
+            confidence = bear_ratio
+        else:
+            return None
+
+        # Filtro de seguridad del Orderbook (rechaza si hay muro adverso en contra: abs(obi) < 0.65 en contra)
+        if snap.obi is not None:
+            obi_val = snap.obi.value
+            if is_long and obi_val < -0.65:
+                logger.info("Kronos BUY vetado por muro institucional de venta (OBI=%.2f < -0.65)", obi_val)
+                return None
+            if is_short and obi_val > 0.65:
+                logger.info("Kronos SELL vetado por muro institucional de compra (OBI=%.2f > +0.65)", obi_val)
+                return None
+
+        mid = state.l2_book.mid_price or last_close
+        if mid <= 0:
+            return None
+
+        # Calibración SL (0.25% - 0.35%) y TP (0.35% - 0.55%)
+        sl_dist = max(mid * 0.0025, min(mid * 0.0030, mid * 0.0035))
+        target_ret = abs(proj_ret)
+        tp_dist = mid * max(0.0035, min(target_ret, 0.0055))
+
+        if is_long:
+            side = SignalSide.BUY
+            sl_price = mid - sl_dist
+            tp_price = mid + tp_dist
+        else:
+            side = SignalSide.SELL
+            sl_price = mid + sl_dist
+            tp_price = mid - tp_dist
+
+        effective_r = round(tp_dist / sl_dist, 2)
+
+        logger.info(
+            "KronosFoundationStrategy señal: %s @ %.2f | bull=%.2f bear=%.2f ret=%+.3f%% | SL=%.2f TP=%.2f (R=%.2f)",
+            side.value, mid, bull_ratio, bear_ratio, proj_ret * 100, sl_price, tp_price, effective_r,
+        )
+
+        return SignalProposal(
+            strategy="KronosFoundationStrategy",
+            side=side,
+            order_type=OrderType.IOC,
+            proposed_price=mid,
+            stop_loss=sl_price,
+            take_profit=tp_price,
+            confidence=round(confidence, 2),
+            expected_r=effective_r,
+            estimated_hold_minutes=30.0,
+            metadata={
+                "bull_ratio": bull_ratio,
+                "bear_ratio": bear_ratio,
+                "proj_ret": proj_ret,
+                "model": "NeoQuasar/Kronos-mini",
+            },
+        )
 
 
 # ── Motor de Decisiones Principal v4 ──────────────────────────────────────────
 
 class DecisionEngine:
     """
-    v4 (MODO CONSERVADOR):
-    - Solo TrendMomentumV4 activa
-    - Máximo 2 trades/día
-    - Gap mínimo de 90 min entre señales
-    - Umbral de confianza 0.68+
-
-    Las estrategias AbsorptionMR, VolatilityBreakout y StopHuntReversal
-    están desactivadas hasta que el backtest confirme que son rentables
-    en condiciones de mercado reales.
+    v4 (MODO CONSERVADOR) / v10 (KRONOS OPTIONAL):
+    - Si USE_KRONOS=true en .env: KronosFoundationStrategy se sitúa en primera posición
+    - SmartMoneyFVGReversal y TrendMomentumV4 como alternativas
+    - Máximo trades/día y gap mínimo de 25-90 min entre señales
     """
 
     def __init__(self, shadow_mode: bool = True) -> None:
         self._shadow_mode = shadow_mode
         self._regime_classifier = RegimeClassifier()
-        self._strategies = [
-            SmartMoneyFVGReversal(),   # v5: primera en evaluar — FVG institucional
-            TrendMomentumV4(),
-            # AbsorptionMeanReversion(),  # DESACTIVADO - win rate <30%
-            # VolatilityBreakout(),       # DESACTIVADO - muchos falsos breakouts
-            # StopHuntReversal(),         # DESACTIVADO - sin datos de backtest
-        ]
+
+        use_kronos = os.getenv("USE_KRONOS", "false").lower() in ("true", "1")
+        if use_kronos:
+            logger.info("⚡ ESTRATEGIA KRONOS FOUNDATION MODEL ACTIVADA (USE_KRONOS=true)")
+            self._strategies = [
+                KronosFoundationStrategy(),
+                SmartMoneyFVGReversal(),
+                TrendMomentumV4(),
+            ]
+        else:
+            self._strategies = [
+                SmartMoneyFVGReversal(),
+                TrendMomentumV4(),
+            ]
         self._on_signal_callbacks: list[Callable[[SignalProposal, bool], None]] = []
         self._last_signal_at: float = 0.0
         self._min_signal_gap_s: float = MIN_SIGNAL_GAP_SECONDS  # 90 min
