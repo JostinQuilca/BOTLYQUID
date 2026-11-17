@@ -708,6 +708,10 @@ class KronosFoundationStrategy:
             logger.exception("Error durante inferencia Kronos (%s)", freq_str)
             return None
 
+        # Evitar falso veto SYSTEM_STALE en RiskValidator por el tiempo de inferencia CPU
+        if getattr(state, "_last_ws_message_at", 0.0) > 0.0:
+            state._last_ws_message_at = time.monotonic()
+
         last_close = float(df["close"].iloc[-1])
         mean_end_close = float(pred_res["mean_df"]["close"].iloc[-2:].mean())
         proj_ret = (mean_end_close - last_close) / last_close
@@ -717,20 +721,23 @@ class KronosFoundationStrategy:
         closes_list = [c.close for c in candles]
         ema_20 = _ema(closes_list, 20)
         ema_50 = _ema(closes_list, 50)
+        rsi_14 = _rsi(closes_list, 14)
         atr_val = _atr(candles, 14)
         atr_pct = (atr_val / last_close) if (atr_val and last_close > 0) else 0.0025
 
         trend_up = (ema_20 is None or ema_50 is None) or (last_close >= ema_20 and ema_20 >= ema_50)
         trend_down = (ema_20 is None or ema_50 is None) or (last_close <= ema_20 and ema_20 <= ema_50)
+        rsi_ok_long = (rsi_14 is None) or (rsi_14 <= 62.0)
+        rsi_ok_short = (rsi_14 is None) or (rsi_14 >= 38.0)
 
         is_long = False
         is_short = False
         confidence = 0.0
 
-        if bull_ratio >= 0.80 and proj_ret >= min_proj_ret and trend_up:
+        if bull_ratio >= 0.80 and proj_ret >= min_proj_ret and trend_up and rsi_ok_long:
             is_long = True
             confidence = bull_ratio
-        elif bear_ratio >= 0.80 and -proj_ret >= min_proj_ret and trend_down:
+        elif bear_ratio >= 0.80 and -proj_ret >= min_proj_ret and trend_down and rsi_ok_short:
             is_short = True
             confidence = bear_ratio
         else:
@@ -851,11 +858,15 @@ class DecisionEngine:
         self._regime_classifier = RegimeClassifier()
 
         if use_kronos is None:
-            from config.settings import get_settings
-            try:
-                use_kronos = os.getenv("USE_KRONOS", "").lower() in ("true", "1") or get_settings().use_kronos
-            except Exception:
-                use_kronos = os.getenv("USE_KRONOS", "false").lower() in ("true", "1")
+            env_val = os.getenv("USE_KRONOS")
+            if env_val is not None and env_val != "":
+                use_kronos = env_val.lower() in ("true", "1")
+            else:
+                from config.settings import get_settings
+                try:
+                    use_kronos = get_settings().use_kronos
+                except Exception:
+                    use_kronos = False
 
         if use_kronos:
             logger.info("⚡ ESTRATEGIA EXCLUSIVA KRONOS FOUNDATION MODEL ACTIVADA (USE_KRONOS=true)")

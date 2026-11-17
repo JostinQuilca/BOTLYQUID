@@ -76,14 +76,15 @@ def _make_state_with_5m_candles(n: int = 260, trend: str = "up") -> MarketState:
     base_ts = 1700000000000
     for i in range(n):
         ts = base_ts + i * 300000
-        delta = i if trend == "up" else -i
+        wave = (8.0 if (i % 2 == 0) else -6.0) if trend == "up" else (-8.0 if (i % 2 == 0) else 6.0)
+        delta = (i * 0.5 + wave) if trend == "up" else (-i * 0.5 + wave)
         base_px = 70000.0 if trend == "up" else 70500.0
         c = Candle(
             timestamp_ms=ts,
             open=base_px + delta,
             high=base_px + 50.0 + delta,
             low=base_px - 50.0 + delta,
-            close=base_px + 20.0 + delta,
+            close=base_px + 10.0 + delta,
             volume=10.0,
             interval="5m",
         )
@@ -223,13 +224,15 @@ def test_kronos_dual_15m_priority_and_5m_fallback():
     base_ts = 1700000000000
     for i in range(260):
         ts = base_ts + i * 900000
+        wave = 8.0 if (i % 2 == 0) else -6.0
+        delta = i * 0.5 + wave
         state.candles_15m.append(
             Candle(
                 timestamp_ms=ts,
-                open=70000.0 + i,
-                high=70050.0 + i,
-                low=69950.0 + i,
-                close=70020.0 + i,
+                open=70000.0 + delta,
+                high=70050.0 + delta,
+                low=69950.0 + delta,
+                close=70010.0 + delta,
                 volume=30.0,
                 interval="15m",
             )

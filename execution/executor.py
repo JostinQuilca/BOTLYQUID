@@ -765,8 +765,12 @@ class HyperliquidExecutor:
         strategy_name = self._active_order.signal.strategy if self._active_order else ""
         hold_limit_min = self._active_order.signal.estimated_hold_minutes if self._active_order else 20.0
 
-        be_trigger = 0.0020 if strategy_name == "KronosFoundationStrategy" else 0.0016
-        be_offset = 0.0014 if strategy_name == "KronosFoundationStrategy" else 0.0010
+        if strategy_name == "KronosFoundationStrategy":
+            be_trigger = 0.0028 if hold_limit_min >= 60.0 else 0.0020
+            be_offset = 0.0015 if hold_limit_min >= 60.0 else 0.0014
+        else:
+            be_trigger = 0.0016
+            be_offset = 0.0010
 
         # ── 1. Break-Even Temprano ────────────────────────────────────────────
         if not self._moved_to_be and (move_pct >= be_trigger or pnl_r >= 0.65) and self._can_modify_order():

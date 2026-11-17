@@ -144,14 +144,21 @@ def run_walkforward_backtest(
 
         ema20 = float(df_window["close"].ewm(span=20, adjust=False).mean().iloc[-1])
         ema50 = float(df_window["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+        deltas = df_window["close"].diff().dropna()
+        gains = deltas.clip(lower=0.0)
+        losses = (-deltas).clip(lower=0.0)
+        avg_gain = float(gains.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+        avg_loss = float(losses.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+        rsi14 = 100.0 - (100.0 / (1.0 + avg_gain / avg_loss)) if avg_loss > 0 else 50.0
+
         tr_series = (df_window["high"] - df_window["low"]).tail(14)
         atr_pct = float(tr_series.mean() / last_close) if last_close > 0 else 0.0025
 
         min_proj_ret = 0.0022 if interval == "5m" else 0.0032
         signal_side = None
-        if bull_ratio >= 0.80 and proj_ret >= min_proj_ret and last_close >= ema20 and ema20 >= ema50:
+        if bull_ratio >= 0.80 and proj_ret >= min_proj_ret and last_close >= ema20 and ema20 >= ema50 and rsi14 <= 62.0:
             signal_side = "LONG"
-        elif bear_ratio >= 0.80 and -proj_ret >= min_proj_ret and last_close <= ema20 and ema20 <= ema50:
+        elif bear_ratio >= 0.80 and -proj_ret >= min_proj_ret and last_close <= ema20 and ema20 <= ema50 and rsi14 >= 38.0:
             signal_side = "SHORT"
 
         if signal_side is None:

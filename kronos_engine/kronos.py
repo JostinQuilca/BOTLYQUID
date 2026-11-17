@@ -534,8 +534,8 @@ class KronosPredictor:
         path_early_min = np.min(paths_close[:, :2], axis=1)
         path_early_max = np.max(paths_close[:, :2], axis=1)
 
-        bull_paths = (path_end_closes > last_close * 1.0012) & (path_early_min >= last_close * 0.9972)
-        bear_paths = (path_end_closes < last_close * 0.9988) & (path_early_max <= last_close * 1.0028)
+        bull_paths = (path_end_closes > last_close * 1.0006) & (path_early_min >= last_close * 0.9972)
+        bear_paths = (path_end_closes < last_close * 0.9994) & (path_early_max <= last_close * 1.0028)
 
         bull_ratio = float(np.mean(bull_paths))
         bear_ratio = float(np.mean(bear_paths))

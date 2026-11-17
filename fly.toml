@@ -4,6 +4,11 @@ swap_size_mb = 512
 
 [build]
 
+[env]
+  USE_KRONOS = 'true'
+  OMP_NUM_THREADS = '1'
+  MKL_NUM_THREADS = '1'
+
 [mounts]
   source = 'bot_data'
   destination = '/app/data/db'
