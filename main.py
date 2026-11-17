@@ -101,6 +101,46 @@ async def main() -> None:
     except Exception:
         logger.exception("Error precargando velas desde SQLite (no cr\u00edtico)")
 
+    # Precargar 280 velas de 5m desde Hyperliquid REST para que Kronos esté listo al instante
+    try:
+        import httpx
+        from data.state import Candle as _Candle5m
+        now_ms = int(time.time() * 1000)
+        start_5m_ms = now_ms - (280 * 5 * 60 * 1000)
+        async with httpx.AsyncClient(timeout=15.0) as _client:
+            _resp = await _client.post(
+                "https://api.hyperliquid.xyz/info",
+                json={
+                    "type": "candleSnapshot",
+                    "req": {
+                        "coin": settings.trading_symbol,
+                        "interval": "5m",
+                        "startTime": start_5m_ms,
+                        "endTime": now_ms,
+                    },
+                },
+            )
+            if _resp.status_code == 200 and isinstance(_resp.json(), list):
+                raw_5m = sorted(_resp.json(), key=lambda c: c["t"])
+                for c in raw_5m[-280:]:
+                    market_state.candles_5m.append(
+                        _Candle5m(
+                            timestamp_ms=int(c["t"]),
+                            open=float(c["o"]),
+                            high=float(c["h"]),
+                            low=float(c["l"]),
+                            close=float(c["c"]),
+                            volume=float(c["v"]),
+                            interval="5m",
+                        )
+                    )
+                logger.info(
+                    "Precargadas %d velas de 5m desde Hyperliquid REST (Kronos listo al instante)",
+                    len(market_state.candles_5m),
+                )
+    except Exception:
+        logger.exception("Error precargando velas de 5m desde Hyperliquid REST (no crítico)")
+
     # ── 2. DatabaseWorker (Cold Path) ──────────────────────────────────────────
     db_worker = DatabaseWorker(db)
 

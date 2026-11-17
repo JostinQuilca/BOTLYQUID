@@ -367,6 +367,10 @@ def print_summary_table(results_5m: dict, results_15m: dict) -> None:
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     print("==================================================================")
     print(" Iniciando Sistema de Backtest Walk-Forward Kronos Foundation")
     print("==================================================================")

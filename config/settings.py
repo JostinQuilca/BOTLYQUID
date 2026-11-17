@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     daily_loss_limit_pct: float = Field(default=0.03, gt=0.0, le=0.10)
     max_drawdown_pct: float = Field(default=0.10, gt=0.0, le=0.25)
     shadow_mode: bool = Field(default=True)
+    use_kronos: bool = Field(default=False)
 
     # ── URLs por entorno ───────────────────────────────────────────────────────
     @property

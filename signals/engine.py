@@ -667,22 +667,24 @@ class KronosFoundationStrategy:
         snap: MicrostructureSnapshot,
         regime: MarketRegime,
     ) -> SignalProposal | None:
-        if len(state.candles_5m) < self._lookback:
+        # Necesitamos al menos 256 velas cerradas + 1 vela actual en formación
+        if len(state.candles_5m) < self._lookback + 1:
             return None
 
-        # Evaluar únicamente UNA VEZ por cada cierre de vela de 5 minutos
-        last_candle = state.candles_5m[-1]
-        if last_candle.timestamp_ms == self._last_evaluated_candle_ts:
+        # Evaluar únicamente UNA VEZ cuando abre un nuevo bloque de 5 minutos
+        current_forming_candle = state.candles_5m[-1]
+        if current_forming_candle.timestamp_ms == self._last_evaluated_candle_ts:
             return None
 
         predictor = self._get_predictor()
         if predictor is None:
             return None
 
-        self._last_evaluated_candle_ts = last_candle.timestamp_ms
+        self._last_evaluated_candle_ts = current_forming_candle.timestamp_ms
 
         import pandas as pd
-        candles = list(state.candles_5m)[-self._lookback:]
+        # Tomar las 256 velas de 5m CERRADAS (excluyendo la actual en formación)
+        candles = list(state.candles_5m)[-(self._lookback + 1):-1]
         df = pd.DataFrame([
             {
                 "open": c.open,
@@ -696,7 +698,9 @@ class KronosFoundationStrategy:
         ])
         x_timestamps = pd.Series(pd.to_datetime([c.timestamp_ms for c in candles], unit="ms"))
         last_ts = x_timestamps.iloc[-1]
-        y_timestamps = pd.Series(pd.date_range(last_ts + pd.Timedelta(minutes=5), periods=self._pred_len, freq="5min"))
+        y_timestamps = pd.Series(
+            pd.date_range(last_ts + pd.Timedelta(minutes=5), periods=self._pred_len, freq="5min")
+        )
 
         try:
             pred_res = predictor.predict_ensemble(
@@ -731,9 +735,9 @@ class KronosFoundationStrategy:
         else:
             return None
 
-        # Filtro de seguridad del Orderbook (rechaza si hay muro adverso en contra: abs(obi) < 0.65 en contra)
+        # Filtro de seguridad del Orderbook (rechaza si hay muro adverso en contra)
+        obi_val = snap.obi.value if snap.obi is not None else 0.0
         if snap.obi is not None:
-            obi_val = snap.obi.value
             if is_long and obi_val < -0.65:
                 logger.info("Kronos BUY vetado por muro institucional de venta (OBI=%.2f < -0.65)", obi_val)
                 return None
@@ -741,23 +745,23 @@ class KronosFoundationStrategy:
                 logger.info("Kronos SELL vetado por muro institucional de compra (OBI=%.2f > +0.65)", obi_val)
                 return None
 
-        mid = state.l2_book.mid_price or last_close
+        mid = (state.l2_book.mid_price if state.l2_book else None) or last_close
         if mid <= 0:
             return None
 
-        # Calibración SL (0.25% - 0.35%) y TP (0.35% - 0.55%)
-        sl_dist = max(mid * 0.0025, min(mid * 0.0030, mid * 0.0035))
+        # Calibración SL (0.30%) y TP (0.35% - 0.55%)
+        sl_dist = mid * 0.0030
         target_ret = abs(proj_ret)
         tp_dist = mid * max(0.0035, min(target_ret, 0.0055))
 
         if is_long:
             side = SignalSide.BUY
-            sl_price = mid - sl_dist
-            tp_price = mid + tp_dist
+            sl_price = round(mid - sl_dist, 2)
+            tp_price = round(mid + tp_dist, 2)
         else:
             side = SignalSide.SELL
-            sl_price = mid + sl_dist
-            tp_price = mid - tp_dist
+            sl_price = round(mid + sl_dist, 2)
+            tp_price = round(mid - tp_dist, 2)
 
         effective_r = round(tp_dist / sl_dist, 2)
 
@@ -773,15 +777,15 @@ class KronosFoundationStrategy:
             proposed_price=mid,
             stop_loss=sl_price,
             take_profit=tp_price,
-            confidence=round(confidence, 2),
-            expected_r=effective_r,
+            regime=regime,
+            obi=obi_val,
+            cvd_1m=snap.cvd.cvd_1m if snap.cvd else 0.0,
+            cvd_5m=snap.cvd.cvd_5m if snap.cvd else 0.0,
+            basis_bps=snap.basis_oi.basis_bps,
+            oi_change_5m=snap.basis_oi.oi_change_5m_pct,
             estimated_hold_minutes=30.0,
-            metadata={
-                "bull_ratio": bull_ratio,
-                "bear_ratio": bear_ratio,
-                "proj_ret": proj_ret,
-                "model": "NeoQuasar/Kronos-mini",
-            },
+            expected_r=effective_r,
+            confidence=round(confidence, 2),
         )
 
 
@@ -801,11 +805,9 @@ class DecisionEngine:
 
         use_kronos = os.getenv("USE_KRONOS", "false").lower() in ("true", "1")
         if use_kronos:
-            logger.info("⚡ ESTRATEGIA KRONOS FOUNDATION MODEL ACTIVADA (USE_KRONOS=true)")
+            logger.info("⚡ ESTRATEGIA EXCLUSIVA KRONOS FOUNDATION MODEL ACTIVADA (USE_KRONOS=true)")
             self._strategies = [
                 KronosFoundationStrategy(),
-                SmartMoneyFVGReversal(),
-                TrendMomentumV4(),
             ]
         else:
             self._strategies = [
