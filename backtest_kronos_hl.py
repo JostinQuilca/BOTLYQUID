@@ -1,15 +1,16 @@
 """
 backtest_kronos_hl.py
 =====================
-Walk-Forward Backtest de KronosFoundationStrategy sobre BTC en Hyperliquid Mainnet.
-Descarga las últimas 600 velas de 5m y 15m directamente de Hyperliquid.
+Walk-Forward Backtest de KronosFoundationStrategy sobre BTC en Hyperliquid Mainnet (Plan v13).
+Descarga las últimas 400 velas de 5m y 15m directamente de Hyperliquid.
 Simula ejecución realista con:
 - Capital inicial: $42.85 USDC (Apalancamiento 2x -> $85.70 USD nocionales)
-- Lookback: 256 velas, Pred_len: 6 velas
-- Consenso Kronos: >= 80% (bull_ratio o bear_ratio >= 0.80) y retorno proyectado >= +0.32%
-- SL: 0.30%
-- TP: min(max(proj_ret, 0.32%), 0.55%) (base 0.40%)
-- Break-Even Temprano: +0.18% de avance sube SL a +0.10%
+- Lookback: 256 velas, Pred_len: 6 velas, Sample_count: 4
+- Consenso Kronos: >= 75% (con protección de trayectoria temprana vela 1-2) y retorno proyectado >= +0.36%
+- Confirmación de tendencia EMA 20 (last_close >= ema20 para LONG, last_close <= ema20 para SHORT)
+- SL: 0.25%
+- TP: max(0.44%, min(abs(proj_ret) * 1.15, 0.60%))
+- Break-Even Temprano: +0.20% de avance sube SL a +0.14%
 - Time-Stop: Cierre en vela 6
 - Comisiones Taker: 0.0864% round-trip
 """
@@ -141,11 +142,12 @@ def run_walkforward_backtest(
         bear_ratio = pred_res["bear_ratio"]
         mean_end_close = float(pred_res["mean_df"]["close"].iloc[-1])
         proj_ret = (mean_end_close - last_close) / last_close
+        ema20 = float(df_window["close"].ewm(span=20, adjust=False).mean().iloc[-1])
 
         signal_side = None
-        if bull_ratio >= 0.75 and proj_ret >= 0.0032:
+        if bull_ratio >= 0.75 and proj_ret >= 0.0036 and last_close >= ema20:
             signal_side = "LONG"
-        elif bear_ratio >= 0.75 and -proj_ret >= 0.0032:
+        elif bear_ratio >= 0.75 and -proj_ret >= 0.0036 and last_close <= ema20:
             signal_side = "SHORT"
 
         if signal_side is None:
@@ -161,21 +163,20 @@ def run_walkforward_backtest(
         entry_ts = timestamps[entry_idx]
         entry_price = last_close
 
-        # Calibración TP/SL según Plan v10
-        target_ret = min(max(abs(proj_ret), 0.0032), 0.0055)
-        sl_pct = 0.0030   # 0.30%
-        tp_pct = target_ret
+        # Calibración TP/SL según Plan v13 (R:R neto positivo post-comisiones)
+        sl_pct = 0.0025   # 0.25%
+        tp_pct = max(0.0044, min(abs(proj_ret) * 1.15, 0.0060))
 
         if signal_side == "LONG":
             tp_price = entry_price * (1.0 + tp_pct)
             initial_sl = entry_price * (1.0 - sl_pct)
-            be_trigger_px = entry_price * (1.0 + 0.0018)  # +0.18%
-            be_sl_px = entry_price * (1.0 + 0.0010)       # +0.10%
+            be_trigger_px = entry_price * (1.0 + 0.0020)  # +0.20%
+            be_sl_px = entry_price * (1.0 + 0.0014)       # +0.14%
         else:
             tp_price = entry_price * (1.0 - tp_pct)
             initial_sl = entry_price * (1.0 + sl_pct)
-            be_trigger_px = entry_price * (1.0 - 0.0018)  # -0.18%
-            be_sl_px = entry_price * (1.0 - 0.0010)       # -0.10%
+            be_trigger_px = entry_price * (1.0 - 0.0020)  # -0.20%
+            be_sl_px = entry_price * (1.0 - 0.0014)       # -0.14%
 
         current_sl = initial_sl
         moved_to_be = False
@@ -395,12 +396,12 @@ def main():
     print(f"Modelo listo en {device.upper()} ({time.time() - t0:.2f}s).")
 
     # 2. Descargar datos de Hyperliquid
-    print("\nDescargando últimas 336 velas de 5m de BTC...")
-    candles_5m = fetch_hyperliquid_candles("5m", limit=336)
+    print("\nDescargando últimas 400 velas de 5m de BTC...")
+    candles_5m = fetch_hyperliquid_candles("5m", limit=400)
     print(f"  Recibidas {len(candles_5m)} velas de 5m. Rango: {pd.to_datetime(candles_5m[0]['t'], unit='ms')} -> {pd.to_datetime(candles_5m[-1]['t'], unit='ms')}")
 
-    print("\nDescargando últimas 336 velas de 15m de BTC...")
-    candles_15m = fetch_hyperliquid_candles("15m", limit=336)
+    print("\nDescargando últimas 400 velas de 15m de BTC...")
+    candles_15m = fetch_hyperliquid_candles("15m", limit=400)
     print(f"  Recibidas {len(candles_15m)} velas de 15m. Rango: {pd.to_datetime(candles_15m[0]['t'], unit='ms')} -> {pd.to_datetime(candles_15m[-1]['t'], unit='ms')}")
 
     # 3. Ejecutar Backtest 5m

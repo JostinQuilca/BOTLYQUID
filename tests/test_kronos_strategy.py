@@ -71,25 +71,28 @@ def _make_snapshot(obi_val: float = 0.1) -> MicrostructureSnapshot:
     )
 
 
-def _make_state_with_5m_candles(n: int = 260) -> MarketState:
+def _make_state_with_5m_candles(n: int = 260, trend: str = "up") -> MarketState:
     state = MarketState()
     base_ts = 1700000000000
     for i in range(n):
         ts = base_ts + i * 300000
+        delta = i if trend == "up" else -i
+        base_px = 70000.0 if trend == "up" else 70500.0
         c = Candle(
             timestamp_ms=ts,
-            open=70000.0 + i,
-            high=70050.0 + i,
-            low=69950.0 + i,
-            close=70020.0 + i,
+            open=base_px + delta,
+            high=base_px + 50.0 + delta,
+            low=base_px - 50.0 + delta,
+            close=base_px + 20.0 + delta,
             volume=10.0,
             interval="5m",
         )
         state.candles_5m.append(c)
 
+    last_px = state.candles_5m[-1].close
     state.l2_book = L2Book(
-        bids=[L2Level(price=70019.0, size=2.0)],
-        asks=[L2Level(price=70021.0, size=2.0)],
+        bids=[L2Level(price=last_px - 1.0, size=2.0)],
+        asks=[L2Level(price=last_px + 1.0, size=2.0)],
         timestamp_ms=base_ts + n * 300000,
     )
     return state
@@ -131,7 +134,7 @@ def test_kronos_valid_long_proposal():
 
 def test_kronos_valid_short_proposal():
     strat = KronosFoundationStrategy()
-    state = _make_state_with_5m_candles(n=260)
+    state = _make_state_with_5m_candles(n=260, trend="down")
     snap = _make_snapshot(obi_val=-0.2)
 
     mock_pred = MagicMock()
@@ -151,7 +154,26 @@ def test_kronos_valid_short_proposal():
     assert sig.regime == MarketRegime.RANGO
     assert sig.stop_loss > sig.proposed_price
     assert sig.take_profit < sig.proposed_price
+    assert sig.expected_r >= 1.76
     assert sig.confidence == 1.0
+
+
+def test_kronos_ema20_blocks_counter_trend():
+    strat = KronosFoundationStrategy()
+    # Tendencia alcista (last_close > ema20) -> SHORT debe ser vetado por filtro EMA20
+    state = _make_state_with_5m_candles(n=260, trend="up")
+    snap = _make_snapshot(obi_val=-0.2)
+
+    mock_pred = MagicMock()
+    mock_pred.predict_ensemble.return_value = {
+        "mean_df": pd.DataFrame({"close": [69900.0, 69850.0, 69800.0, 69750.0, 69700.0, 69600.0]}),
+        "bull_ratio": 0.0,
+        "bear_ratio": 1.0,
+    }
+    strat._predictor = mock_pred
+
+    sig = strat.evaluate(state, snap, MarketRegime.RANGO)
+    assert sig is None
 
 
 def test_kronos_obi_filter_blocks_long():

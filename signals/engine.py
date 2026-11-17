@@ -621,13 +621,13 @@ class TrendMomentumV4:
 
 class KronosFoundationStrategy:
     """
-    Estrategia basada en el Modelo Fundacional de K-lines Kronos (Plan v10).
+    Estrategia basada en el Modelo Fundacional de K-lines Kronos (Plan v13).
     - Utiliza NeoQuasar/Kronos-mini y NeoQuasar/Kronos-Tokenizer-2k.
     - Se evalúa únicamente una vez por cada cierre de vela de 5 minutos (evitando sobrecarga de CPU).
-    - Requiere consenso probabilístico >= 80% (al menos 4 de 5 trayectorias).
-    - Exige proyección de retorno que supere el 0.0864% de comisiones Taker (mínimo +0.32%).
+    - Requiere consenso probabilístico >= 75% (al menos 3 de 4 trayectorias con protección temprana).
+    - Exige proyección de retorno >= +0.36% y alineación de tendencia con EMA20 de 5m.
     - Filtro de seguridad del Orderbook: rechaza la señal si hay un muro adverso (OBI > 0.65 en contra).
-    - SL calibrado entre 0.25% y 0.35%, TP calibrado entre 0.35% y 0.55%.
+    - SL calibrado en 0.25%, TP calibrado entre 0.44% y 0.60% (R:R neto positivo post-comisiones).
     """
 
     def __init__(self) -> None:
@@ -637,7 +637,7 @@ class KronosFoundationStrategy:
         self._last_evaluated_candle_ts: int = 0
         self._lookback = 256
         self._pred_len = 6
-        self._sample_count = 5
+        self._sample_count = 4
         self._temperature = 0.6
         self._top_p = 0.9
 
@@ -721,15 +721,16 @@ class KronosFoundationStrategy:
         proj_ret = (mean_end_close - last_close) / last_close
         bull_ratio = pred_res["bull_ratio"]
         bear_ratio = pred_res["bear_ratio"]
+        ema_20 = _ema([c.close for c in candles], 20)
 
         is_long = False
         is_short = False
         confidence = 0.0
 
-        if bull_ratio >= 0.80 and proj_ret >= 0.0032:
+        if bull_ratio >= 0.75 and proj_ret >= 0.0036 and (ema_20 is None or last_close >= ema_20):
             is_long = True
             confidence = bull_ratio
-        elif bear_ratio >= 0.80 and -proj_ret >= 0.0032:
+        elif bear_ratio >= 0.75 and -proj_ret >= 0.0036 and (ema_20 is None or last_close <= ema_20):
             is_short = True
             confidence = bear_ratio
         else:
@@ -749,10 +750,10 @@ class KronosFoundationStrategy:
         if mid <= 0:
             return None
 
-        # Calibración SL (0.30%) y TP (0.35% - 0.55%)
-        sl_dist = mid * 0.0030
+        # Calibración SL (0.25%) y TP (0.44% - 0.60%) para R:R neto > 1.05:1 tras fees Taker (0.0864%)
+        sl_dist = mid * 0.0025
         target_ret = abs(proj_ret)
-        tp_dist = mid * max(0.0035, min(target_ret, 0.0055))
+        tp_dist = mid * max(0.0044, min(target_ret * 1.15, 0.0060))
 
         if is_long:
             side = SignalSide.BUY

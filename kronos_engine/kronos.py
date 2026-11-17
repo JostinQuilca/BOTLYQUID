@@ -526,10 +526,17 @@ class KronosPredictor:
         mean_preds = np.mean(paths_denorm, axis=0)      # (pred_len, 6)
         paths_close = paths_denorm[:, :, 3]             # (sample_count, pred_len)
 
-        # Consenso direccional usando el promedio de las últimas 2 velas predichas de cada trayectoria
+        # Consenso direccional: exige que el cierre final (últimas 2 velas) avance en dirección
+        # Y que las primeras 2 velas no sufran una excursión adversa > 0.18% que dispare el SL
         path_end_closes = np.mean(paths_close[:, -2:], axis=1)
-        bull_ratio = float(np.mean(path_end_closes > last_close * 1.0012))
-        bear_ratio = float(np.mean(path_end_closes < last_close * 0.9988))
+        path_early_min = np.min(paths_close[:, :2], axis=1)
+        path_early_max = np.max(paths_close[:, :2], axis=1)
+
+        bull_paths = (path_end_closes > last_close * 1.0015) & (path_early_min >= last_close * 0.9982)
+        bear_paths = (path_end_closes < last_close * 0.9985) & (path_early_max <= last_close * 1.0018)
+
+        bull_ratio = float(np.mean(bull_paths))
+        bear_ratio = float(np.mean(bear_paths))
 
         mean_df = pd.DataFrame(
             mean_preds,

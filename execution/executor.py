@@ -762,9 +762,15 @@ class HyperliquidExecutor:
         pnl_r = ((mark_price - entry_price) / sl_dist) if is_long else ((entry_price - mark_price) / sl_dist)
         elapsed_minutes = (time.monotonic() - self._entry_time) / 60.0
 
-        # ── 1. Break-Even Temprano (+0.16% de avance o +0.55R) ────────────────
-        if not self._moved_to_be and (move_pct >= 0.0016 or pnl_r >= 0.55) and self._can_modify_order():
-            be_price = entry_price * 1.0010 if is_long else entry_price * 0.9990
+        strategy_name = self._active_order.signal.strategy if self._active_order else ""
+        hold_limit_min = self._active_order.signal.estimated_hold_minutes if self._active_order else 20.0
+
+        be_trigger = 0.0020 if strategy_name == "KronosFoundationStrategy" else 0.0016
+        be_offset = 0.0014 if strategy_name == "KronosFoundationStrategy" else 0.0010
+
+        # ── 1. Break-Even Temprano ────────────────────────────────────────────
+        if not self._moved_to_be and (move_pct >= be_trigger or pnl_r >= 0.65) and self._can_modify_order():
+            be_price = entry_price * (1.0 + be_offset) if is_long else entry_price * (1.0 - be_offset)
             be_price = float(round(be_price)) if self._symbol == "BTC" else round(be_price, 2)
             logger.info(
                 "Break-Even temprano activado: move=%+.3f%% (+%.2fR). Moviendo SL a %.2f (entry=%.2f)",
@@ -801,9 +807,6 @@ class HyperliquidExecutor:
                     )
             except Exception:
                 logger.exception("Error aplicando break-even temprano")
-
-        strategy_name = self._active_order.signal.strategy if self._active_order else ""
-        hold_limit_min = self._active_order.signal.estimated_hold_minutes if self._active_order else 20.0
 
         # ── 2. Cobro Rápido en Verde (solo para estrategias rápidas de 1m, NO para Kronos 30m) ──
         if strategy_name != "KronosFoundationStrategy" and elapsed_minutes >= 8.0 and move_pct >= 0.0015:

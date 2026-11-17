@@ -19,6 +19,12 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.1",
     "eth-account>=0.11.0",
+    "requests>=2.31.0",
+    "torch>=2.2.0",
+    "huggingface-hub>=0.23.0",
+    "einops>=0.8.0",
+    "tqdm>=4.66.0",
+    "safetensors>=0.4.3",
 ]
 
 [project.optional-dependencies]
