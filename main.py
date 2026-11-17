@@ -42,6 +42,9 @@ logger = logging.getLogger("main")
 
 
 async def main() -> None:
+    from dotenv import load_dotenv
+    load_dotenv()
+
     from config.settings import get_settings
     from data.database import BotProcessState, DatabaseWorker, DBEvent, init_db, set_bot_state
     from data.ingestor import HyperliquidIngestor
@@ -154,7 +157,10 @@ async def main() -> None:
         symbol=settings.trading_symbol,
     )
 
-    decision_engine = DecisionEngine(shadow_mode=settings.shadow_mode)
+    decision_engine = DecisionEngine(
+        shadow_mode=settings.shadow_mode,
+        use_kronos=settings.use_kronos,
+    )
     state_machine = ExecutorStateMachine()
 
     # ── 4. Ejecutor (solo si no es shadow mode) ────────────────────────────────

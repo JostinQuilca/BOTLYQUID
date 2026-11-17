@@ -802,8 +802,11 @@ class HyperliquidExecutor:
             except Exception:
                 logger.exception("Error aplicando break-even temprano")
 
-        # ── 2. Cobro Rápido en Verde (Horizonte 8–15 min como Shadow Mode) ────
-        if elapsed_minutes >= 8.0 and move_pct >= 0.0015:
+        strategy_name = self._active_order.signal.strategy if self._active_order else ""
+        hold_limit_min = self._active_order.signal.estimated_hold_minutes if self._active_order else 20.0
+
+        # ── 2. Cobro Rápido en Verde (solo para estrategias rápidas de 1m, NO para Kronos 30m) ──
+        if strategy_name != "KronosFoundationStrategy" and elapsed_minutes >= 8.0 and move_pct >= 0.0015:
             logger.info(
                 "Scalp Profit Exit: %.1f min abierta con ganancia %+.3f%%. Cerrando en verde a mercado.",
                 elapsed_minutes, move_pct * 100,
@@ -819,15 +822,15 @@ class HyperliquidExecutor:
             await self._emergency_close(self._filled_size, "Scalp Profit Exit in green")
             return
 
-        # ── 3. Time-Stop (20 minutos estancada) ───────────────────────────────
-        if elapsed_minutes >= 20.0 and -0.25 <= pnl_r <= 0.40:
+        # ── 3. Time-Stop (según horizonte de la estrategia: 30m en Kronos, 20m en resto) ──
+        if elapsed_minutes >= hold_limit_min and -0.25 <= pnl_r <= 0.40:
             logger.warning(
-                "Time-Stop activado: %.0f min elapsed, PnL=%.2fR. Cerrando.",
-                elapsed_minutes, pnl_r,
+                "Time-Stop activado (%.0fm): %.0f min elapsed, PnL=%.2fR. Cerrando.",
+                hold_limit_min, elapsed_minutes, pnl_r,
             )
             if self._alerter:
                 await self._alerter.send(
-                    f"⏱ *TIME-STOP EJECUTADO (20m)*\n"
+                    f"⏱ *TIME-STOP EJECUTADO ({hold_limit_min:.0f}m)*\n"
                     f"Posición sin impulso (`{pnl_r:+.2f}R`). Cerrando a mercado...",
                     alert_type="WARNING",
                 )

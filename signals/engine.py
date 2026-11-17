@@ -799,11 +799,17 @@ class DecisionEngine:
     - Máximo trades/día y gap mínimo de 25-90 min entre señales
     """
 
-    def __init__(self, shadow_mode: bool = True) -> None:
+    def __init__(self, shadow_mode: bool = True, use_kronos: bool | None = None) -> None:
         self._shadow_mode = shadow_mode
         self._regime_classifier = RegimeClassifier()
 
-        use_kronos = os.getenv("USE_KRONOS", "false").lower() in ("true", "1")
+        if use_kronos is None:
+            from config.settings import get_settings
+            try:
+                use_kronos = os.getenv("USE_KRONOS", "").lower() in ("true", "1") or get_settings().use_kronos
+            except Exception:
+                use_kronos = os.getenv("USE_KRONOS", "false").lower() in ("true", "1")
+
         if use_kronos:
             logger.info("⚡ ESTRATEGIA EXCLUSIVA KRONOS FOUNDATION MODEL ACTIVADA (USE_KRONOS=true)")
             self._strategies = [

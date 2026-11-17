@@ -173,6 +173,15 @@ def test_kronos_obi_filter_blocks_long():
 
 
 def test_decision_engine_exclusive_when_use_kronos(monkeypatch):
+    # Por argumento explícito
+    engine_arg = DecisionEngine(shadow_mode=True, use_kronos=True)
+    assert len(engine_arg._strategies) == 1
+    assert isinstance(engine_arg._strategies[0], KronosFoundationStrategy)
+
+    engine_arg_off = DecisionEngine(shadow_mode=True, use_kronos=False)
+    assert len(engine_arg_off._strategies) == 2
+
+    # Por variable de entorno
     monkeypatch.setenv("USE_KRONOS", "true")
     engine = DecisionEngine(shadow_mode=True)
     assert len(engine._strategies) == 1

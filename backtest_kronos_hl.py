@@ -30,7 +30,7 @@ NOTIONAL = INITIAL_CAPITAL * LEVERAGE  # $85.70 USD
 TAKER_FEE_PCT = 0.000864               # 0.0864% (2x 0.0432%)
 LOOKBACK = 256
 PRED_LEN = 6
-SAMPLE_COUNT = 5
+SAMPLE_COUNT = 4
 TEMPERATURE = 0.6
 TOP_P = 0.9
 
@@ -143,9 +143,9 @@ def run_walkforward_backtest(
         proj_ret = (mean_end_close - last_close) / last_close
 
         signal_side = None
-        if bull_ratio >= 0.80 and proj_ret >= 0.0032:
+        if bull_ratio >= 0.75 and proj_ret >= 0.0032:
             signal_side = "LONG"
-        elif bear_ratio >= 0.80 and -proj_ret >= 0.0032:
+        elif bear_ratio >= 0.75 and -proj_ret >= 0.0032:
             signal_side = "SHORT"
 
         if signal_side is None:
@@ -191,44 +191,54 @@ def run_walkforward_backtest(
             c_close = closes[curr_fwd_idx]
 
             if signal_side == "LONG":
-                # 1. Break-Even check
-                if not moved_to_be and c_high >= be_trigger_px:
-                    current_sl = be_sl_px
-                    moved_to_be = True
-
-                # 2. SL hit check
+                # 1. Comprobar SL vigente antes de mover a BE en esta misma vela
                 if c_low <= current_sl:
                     exit_price = current_sl
                     exit_reason = "BE_SL" if moved_to_be else "SL"
                     exit_idx = curr_fwd_idx
                     break
 
-                # 3. TP hit check
+                # 2. Comprobar TP alcanzado en esta vela
                 if c_high >= tp_price:
                     exit_price = tp_price
                     exit_reason = "TP"
                     exit_idx = curr_fwd_idx
                     break
 
-            else:  # SHORT
-                # 1. Break-Even check
-                if not moved_to_be and c_low <= be_trigger_px:
+                # 3. Activar Break-Even para siguientes velas (o cerrar si la propia vela retrocedió bajo BE al cierre)
+                if not moved_to_be and c_high >= be_trigger_px:
                     current_sl = be_sl_px
                     moved_to_be = True
+                    if c_close <= current_sl:
+                        exit_price = current_sl
+                        exit_reason = "BE_SL"
+                        exit_idx = curr_fwd_idx
+                        break
 
-                # 2. SL hit check
+            else:  # SHORT
+                # 1. Comprobar SL vigente antes de mover a BE en esta misma vela
                 if c_high >= current_sl:
                     exit_price = current_sl
                     exit_reason = "BE_SL" if moved_to_be else "SL"
                     exit_idx = curr_fwd_idx
                     break
 
-                # 3. TP hit check
+                # 2. Comprobar TP alcanzado en esta vela
                 if c_low <= tp_price:
                     exit_price = tp_price
                     exit_reason = "TP"
                     exit_idx = curr_fwd_idx
                     break
+
+                # 3. Activar Break-Even para siguientes velas (o cerrar si la propia vela rebotó sobre BE al cierre)
+                if not moved_to_be and c_low <= be_trigger_px:
+                    current_sl = be_sl_px
+                    moved_to_be = True
+                    if c_close >= current_sl:
+                        exit_price = current_sl
+                        exit_reason = "BE_SL"
+                        exit_idx = curr_fwd_idx
+                        break
 
             # 4. Time-Stop al término de la vela 6 (step == PRED_LEN - 1)
             if step == PRED_LEN - 1:
@@ -385,12 +395,12 @@ def main():
     print(f"Modelo listo en {device.upper()} ({time.time() - t0:.2f}s).")
 
     # 2. Descargar datos de Hyperliquid
-    print("\nDescargando últimas 600 velas de 5m de BTC...")
-    candles_5m = fetch_hyperliquid_candles("5m", limit=600)
+    print("\nDescargando últimas 336 velas de 5m de BTC...")
+    candles_5m = fetch_hyperliquid_candles("5m", limit=336)
     print(f"  Recibidas {len(candles_5m)} velas de 5m. Rango: {pd.to_datetime(candles_5m[0]['t'], unit='ms')} -> {pd.to_datetime(candles_5m[-1]['t'], unit='ms')}")
 
-    print("\nDescargando últimas 600 velas de 15m de BTC...")
-    candles_15m = fetch_hyperliquid_candles("15m", limit=600)
+    print("\nDescargando últimas 336 velas de 15m de BTC...")
+    candles_15m = fetch_hyperliquid_candles("15m", limit=336)
     print(f"  Recibidas {len(candles_15m)} velas de 15m. Rango: {pd.to_datetime(candles_15m[0]['t'], unit='ms')} -> {pd.to_datetime(candles_15m[-1]['t'], unit='ms')}")
 
     # 3. Ejecutar Backtest 5m
