@@ -621,10 +621,11 @@ class TrendMomentumV4:
 
 class KronosFoundationStrategy:
     """
-    Estrategia basada en el Modelo Fundacional de K-lines Kronos (Plan v14 Dual 15m + 5m).
-    - Motor principal en 15m (horizonte 90m): consenso >= 75%, retorno proyectado >= 0.35% + EMA20.
-    - Motor táctico en 5m (horizonte 30m): consenso >= 75%, retorno proyectado >= 0.28% + EMA20.
-    - SL calibrado en 0.25%, TP entre 0.44% y 0.60% (R:R neto positivo tras 0.0864% Taker fee).
+    Estrategia basada en el Modelo Fundacional de K-lines Kronos (Plan v15 Determinista Dual 15m + 5m).
+    - Inferencia determinista (T=0.30, sample_count=5, consenso >= 80%).
+    - Motor principal en 15m (horizonte 90m): retorno proyectado >= 0.32% + estructura EMA20/EMA50.
+    - Motor táctico en 5m (horizonte 30m): retorno proyectado >= 0.22% + estructura EMA20/EMA50.
+    - SL/TP adaptativos al ATR por temporalidad con R:R neto positivo tras 0.0864% Taker fee.
     """
 
     def __init__(self) -> None:
@@ -635,8 +636,8 @@ class KronosFoundationStrategy:
         self._last_evaluated_15m_ts: int = 0
         self._lookback = 256
         self._pred_len = 6
-        self._sample_count = 4
-        self._temperature = 0.6
+        self._sample_count = 5
+        self._temperature = 0.30
         self._top_p = 0.9
 
     def _get_predictor(self) -> Any | None:
@@ -708,20 +709,28 @@ class KronosFoundationStrategy:
             return None
 
         last_close = float(df["close"].iloc[-1])
-        mean_end_close = float(pred_res["mean_df"]["close"].iloc[-1])
+        mean_end_close = float(pred_res["mean_df"]["close"].iloc[-2:].mean())
         proj_ret = (mean_end_close - last_close) / last_close
         bull_ratio = pred_res["bull_ratio"]
         bear_ratio = pred_res["bear_ratio"]
-        ema_20 = _ema([c.close for c in candles], 20)
+
+        closes_list = [c.close for c in candles]
+        ema_20 = _ema(closes_list, 20)
+        ema_50 = _ema(closes_list, 50)
+        atr_val = _atr(candles, 14)
+        atr_pct = (atr_val / last_close) if (atr_val and last_close > 0) else 0.0025
+
+        trend_up = (ema_20 is None or ema_50 is None) or (last_close >= ema_20 and ema_20 >= ema_50)
+        trend_down = (ema_20 is None or ema_50 is None) or (last_close <= ema_20 and ema_20 <= ema_50)
 
         is_long = False
         is_short = False
         confidence = 0.0
 
-        if bull_ratio >= 0.75 and proj_ret >= min_proj_ret and (ema_20 is None or last_close >= ema_20):
+        if bull_ratio >= 0.80 and proj_ret >= min_proj_ret and trend_up:
             is_long = True
             confidence = bull_ratio
-        elif bear_ratio >= 0.75 and -proj_ret >= min_proj_ret and (ema_20 is None or last_close <= ema_20):
+        elif bear_ratio >= 0.80 and -proj_ret >= min_proj_ret and trend_down:
             is_short = True
             confidence = bear_ratio
         else:
@@ -740,9 +749,15 @@ class KronosFoundationStrategy:
         if mid <= 0:
             return None
 
-        sl_dist = mid * 0.0025
-        target_ret = abs(proj_ret)
-        tp_dist = mid * max(0.0044, min(target_ret * 1.15, 0.0060))
+        if step_minutes == 15:
+            sl_pct = max(0.0038, min(1.2 * atr_pct, 0.0048))
+            tp_pct = max(sl_pct * 1.55, min(abs(proj_ret) * 1.30, 0.0080))
+        else:
+            sl_pct = max(0.0026, min(1.3 * atr_pct, 0.0035))
+            tp_pct = max(sl_pct * 1.55, min(abs(proj_ret) * 1.25, 0.0060))
+
+        sl_dist = mid * sl_pct
+        tp_dist = mid * tp_pct
 
         if is_long:
             side = SignalSide.BUY
@@ -784,7 +799,7 @@ class KronosFoundationStrategy:
         snap: MicrostructureSnapshot,
         regime: MarketRegime,
     ) -> SignalProposal | None:
-        # 1. Prioridad: evaluar cierre de vela de 15m (horizonte 90m, min_proj_ret=0.35%)
+        # 1. Prioridad: evaluar cierre de vela de 15m (horizonte 90m, min_proj_ret=0.32%)
         if hasattr(state, "candles_15m") and len(state.candles_15m) >= self._lookback + 1:
             curr_15m = state.candles_15m[-1]
             if curr_15m.timestamp_ms != self._last_evaluated_15m_ts:
@@ -793,7 +808,7 @@ class KronosFoundationStrategy:
                     candles_deque=state.candles_15m,
                     freq_str="15min",
                     step_minutes=15,
-                    min_proj_ret=0.0035,
+                    min_proj_ret=0.0032,
                     hold_minutes=90.0,
                     state=state,
                     snap=snap,
@@ -802,7 +817,7 @@ class KronosFoundationStrategy:
                 if sig_15m is not None:
                     return sig_15m
 
-        # 2. Secundario: evaluar cierre de vela de 5m (horizonte 30m, min_proj_ret=0.28%)
+        # 2. Secundario: evaluar cierre de vela de 5m (horizonte 30m, min_proj_ret=0.22%)
         if len(state.candles_5m) >= self._lookback + 1:
             curr_5m = state.candles_5m[-1]
             if curr_5m.timestamp_ms != self._last_evaluated_5m_ts:
@@ -811,7 +826,7 @@ class KronosFoundationStrategy:
                     candles_deque=state.candles_5m,
                     freq_str="5min",
                     step_minutes=5,
-                    min_proj_ret=0.0028,
+                    min_proj_ret=0.0022,
                     hold_minutes=30.0,
                     state=state,
                     snap=snap,

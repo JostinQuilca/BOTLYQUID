@@ -1,16 +1,15 @@
 """
 backtest_kronos_hl.py
 =====================
-Walk-Forward Backtest de KronosFoundationStrategy sobre BTC en Hyperliquid Mainnet (Plan v14).
+Walk-Forward Backtest de KronosFoundationStrategy sobre BTC en Hyperliquid Mainnet (Plan v15).
 Descarga las últimas 400 velas de 5m y 15m directamente de Hyperliquid.
 Simula ejecución realista con:
 - Capital inicial: $42.85 USDC (Apalancamiento 2x -> $85.70 USD nocionales)
-- Lookback: 256 velas, Pred_len: 6 velas, Sample_count: 4
-- Consenso Kronos: >= 75% (con protección de trayectoria temprana vela 1-2) y retorno proyectado >= +0.28% (5m) / +0.35% (15m)
-- Confirmación de tendencia EMA 20 (last_close >= ema20 para LONG, last_close <= ema20 para SHORT)
-- SL: 0.25%
-- TP: max(0.44%, min(abs(proj_ret) * 1.15, 0.60%))
-- Break-Even Temprano: +0.20% de avance sube SL a +0.14%
+- Lookback: 256 velas, Pred_len: 6 velas, Sample_count: 5, T: 0.30 (semilla determinista)
+- Consenso Kronos: >= 80% (con tolerancia temprana -0.28%) y retorno proyectado >= +0.22% (5m) / +0.32% (15m)
+- Alineación estructural EMA20/EMA50
+- SL/TP/Break-Even adaptativos al ATR por temporalidad
+- Cooldown post-SL: 4 velas
 - Time-Stop: Cierre en vela 6
 - Comisiones Taker: 0.0864% round-trip
 """
@@ -31,8 +30,8 @@ NOTIONAL = INITIAL_CAPITAL * LEVERAGE  # $85.70 USD
 TAKER_FEE_PCT = 0.000864               # 0.0864% (2x 0.0432%)
 LOOKBACK = 256
 PRED_LEN = 6
-SAMPLE_COUNT = 4
-TEMPERATURE = 0.6
+SAMPLE_COUNT = 5
+TEMPERATURE = 0.30
 TOP_P = 0.9
 
 
@@ -140,15 +139,19 @@ def run_walkforward_backtest(
 
         bull_ratio = pred_res["bull_ratio"]
         bear_ratio = pred_res["bear_ratio"]
-        mean_end_close = float(pred_res["mean_df"]["close"].iloc[-1])
+        mean_end_close = float(pred_res["mean_df"]["close"].iloc[-2:].mean())
         proj_ret = (mean_end_close - last_close) / last_close
-        ema20 = float(df_window["close"].ewm(span=20, adjust=False).mean().iloc[-1])
 
-        min_proj_ret = 0.0028 if interval == "5m" else 0.0035
+        ema20 = float(df_window["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(df_window["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+        tr_series = (df_window["high"] - df_window["low"]).tail(14)
+        atr_pct = float(tr_series.mean() / last_close) if last_close > 0 else 0.0025
+
+        min_proj_ret = 0.0022 if interval == "5m" else 0.0032
         signal_side = None
-        if bull_ratio >= 0.75 and proj_ret >= min_proj_ret and last_close >= ema20:
+        if bull_ratio >= 0.80 and proj_ret >= min_proj_ret and last_close >= ema20 and ema20 >= ema50:
             signal_side = "LONG"
-        elif bear_ratio >= 0.75 and -proj_ret >= min_proj_ret and last_close <= ema20:
+        elif bear_ratio >= 0.80 and -proj_ret >= min_proj_ret and last_close <= ema20 and ema20 <= ema50:
             signal_side = "SHORT"
 
         if signal_side is None:
@@ -164,20 +167,28 @@ def run_walkforward_backtest(
         entry_ts = timestamps[entry_idx]
         entry_price = last_close
 
-        # Calibración TP/SL según Plan v13 (R:R neto positivo post-comisiones)
-        sl_pct = 0.0025   # 0.25%
-        tp_pct = max(0.0044, min(abs(proj_ret) * 1.15, 0.0060))
+        # Calibración TP/SL/BE adaptada al ATR por temporalidad (Plan v15)
+        if interval == "15m":
+            sl_pct = max(0.0038, min(1.2 * atr_pct, 0.0048))
+            tp_pct = max(sl_pct * 1.55, min(abs(proj_ret) * 1.30, 0.0080))
+            be_trig_pct = sl_pct * 0.65
+            be_lock_pct = 0.0015
+        else:
+            sl_pct = max(0.0026, min(1.3 * atr_pct, 0.0035))
+            tp_pct = max(sl_pct * 1.55, min(abs(proj_ret) * 1.25, 0.0060))
+            be_trig_pct = sl_pct * 0.70
+            be_lock_pct = 0.0014
 
         if signal_side == "LONG":
             tp_price = entry_price * (1.0 + tp_pct)
             initial_sl = entry_price * (1.0 - sl_pct)
-            be_trigger_px = entry_price * (1.0 + 0.0020)  # +0.20%
-            be_sl_px = entry_price * (1.0 + 0.0014)       # +0.14%
+            be_trigger_px = entry_price * (1.0 + be_trig_pct)
+            be_sl_px = entry_price * (1.0 + be_lock_pct)
         else:
             tp_price = entry_price * (1.0 - tp_pct)
             initial_sl = entry_price * (1.0 + sl_pct)
-            be_trigger_px = entry_price * (1.0 - 0.0020)  # -0.20%
-            be_sl_px = entry_price * (1.0 - 0.0014)       # -0.14%
+            be_trigger_px = entry_price * (1.0 - be_trig_pct)
+            be_sl_px = entry_price * (1.0 - be_lock_pct)
 
         current_sl = initial_sl
         moved_to_be = False
@@ -292,8 +303,9 @@ def run_walkforward_backtest(
             f"({exit_reason:9s}) | Net: {net_ret*100:+.2f}% (${trade_pnl:+.3f}) | Equity: ${equity:.2f}"
         )
 
-        # Avanzar el índice al cierre del trade para evitar trades superpuestos
-        idx = exit_idx + 1
+        # Si tocó SL, esperar 4 velas de cooldown (igual que RiskValidator en vivo)
+        cooldown_bars = 4 if exit_reason == "SL" else 1
+        idx = exit_idx + cooldown_bars
 
     total_time = time.time() - start_time_all
     print(f" Backtest finalizado en {total_time:.1f}s. Evaluadas {evaluated_candles} velas.")

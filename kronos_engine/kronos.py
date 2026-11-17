@@ -423,7 +423,7 @@ class KronosPredictor:
         x_timestamp: pd.Series,
         y_timestamp: pd.Series,
         pred_len: int,
-        T: float = 0.6,
+        T: float = 0.30,
         top_k: int = 0,
         top_p: float = 0.9,
         sample_count: int = 5,
@@ -457,6 +457,9 @@ class KronosPredictor:
         last_close = float(x[-1, 3])
         x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
         x_norm = np.clip((x - x_mean) / (x_std + 1e-5), -self.clip, self.clip)
+
+        seed = (int(abs(last_close * 100)) + int(x_time_df["minute"].iloc[-1]) * 1000) % (2**31 - 1)
+        torch.manual_seed(seed)
 
         with torch.no_grad():
             x_tensor = torch.from_numpy(x_norm[np.newaxis, :]).to(self.device)
@@ -526,14 +529,13 @@ class KronosPredictor:
         mean_preds = np.mean(paths_denorm, axis=0)      # (pred_len, 6)
         paths_close = paths_denorm[:, :, 3]             # (sample_count, pred_len)
 
-        # Consenso direccional: exige que el cierre final (últimas 2 velas) avance en dirección
-        # Y que las primeras 2 velas no sufran una excursión adversa > 0.18% que dispare el SL
+        # Consenso direccional sobre el tramo final (últimas 2 velas) con tolerancia al ruido de cuantización inicial
         path_end_closes = np.mean(paths_close[:, -2:], axis=1)
         path_early_min = np.min(paths_close[:, :2], axis=1)
         path_early_max = np.max(paths_close[:, :2], axis=1)
 
-        bull_paths = (path_end_closes > last_close * 1.0015) & (path_early_min >= last_close * 0.9982)
-        bear_paths = (path_end_closes < last_close * 0.9985) & (path_early_max <= last_close * 1.0018)
+        bull_paths = (path_end_closes > last_close * 1.0012) & (path_early_min >= last_close * 0.9972)
+        bear_paths = (path_end_closes < last_close * 0.9988) & (path_early_max <= last_close * 1.0028)
 
         bull_ratio = float(np.mean(bull_paths))
         bear_ratio = float(np.mean(bear_paths))
