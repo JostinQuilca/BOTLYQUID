@@ -247,12 +247,16 @@ def test_kronos_dual_15m_priority_and_5m_fallback():
     }
     strat._predictor = mock_pred
 
-    # 1. Primera llamada debe priorizar 15m (hold_minutes = 90.0)
+    # 1. Primera llamada opera 15m (hold_minutes = 90.0)
     sig_15m = strat.evaluate(state, snap, MarketRegime.RANGO)
     assert sig_15m is not None
     assert sig_15m.estimated_hold_minutes == 90.0
 
-    # 2. Segunda llamada en el mismo bloque de 15m debe caer al cierre de 5m (hold_minutes = 30.0)
+    # 2. Segunda llamada en el mismo bloque de 15m retorna None (bloquea ruido de 5m)
+    assert strat.evaluate(state, snap, MarketRegime.RANGO) is None
+
+    # 3. Solo si no hay velas de 15m disponibles cae al respaldo de 5m (hold_minutes = 30.0)
+    state.candles_15m.clear()
     sig_5m = strat.evaluate(state, snap, MarketRegime.RANGO)
     assert sig_5m is not None
     assert sig_5m.estimated_hold_minutes == 30.0

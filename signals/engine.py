@@ -806,12 +806,12 @@ class KronosFoundationStrategy:
         snap: MicrostructureSnapshot,
         regime: MarketRegime,
     ) -> SignalProposal | None:
-        # 1. Prioridad: evaluar cierre de vela de 15m (horizonte 90m, min_proj_ret=0.32%)
+        # 1. Producción: si hay buffer de 15m cargado, operar EXCLUSIVAMENTE cierres de 15m (evita ruido de 5m)
         if hasattr(state, "candles_15m") and len(state.candles_15m) >= self._lookback + 1:
             curr_15m = state.candles_15m[-1]
             if curr_15m.timestamp_ms != self._last_evaluated_15m_ts:
                 self._last_evaluated_15m_ts = curr_15m.timestamp_ms
-                sig_15m = self._evaluate_timeframe(
+                return self._evaluate_timeframe(
                     candles_deque=state.candles_15m,
                     freq_str="15min",
                     step_minutes=15,
@@ -821,10 +821,9 @@ class KronosFoundationStrategy:
                     snap=snap,
                     regime=regime,
                 )
-                if sig_15m is not None:
-                    return sig_15m
+            return None
 
-        # 2. Secundario: evaluar cierre de vela de 5m (horizonte 30m, min_proj_ret=0.22%)
+        # 2. Respaldo de emergencia (solo si no hay buffer de 15m): evaluar cierre de vela de 5m
         if len(state.candles_5m) >= self._lookback + 1:
             curr_5m = state.candles_5m[-1]
             if curr_5m.timestamp_ms != self._last_evaluated_5m_ts:
