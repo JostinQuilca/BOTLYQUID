@@ -210,15 +210,21 @@ class TestAccountLimits:
         """PÃ©rdida diaria > 3% debe pausar el bot."""
         state = make_healthy_state(equity=10_000.0)
 
-        # Insertar estado de riesgo del dÃ­a con pÃ©rdida del 4%
+        # Pérdida diaria del 4%: unrealized en daily_risk (-100) + realized como
+        # fill de cierre en live_fills (-300), que es ahora la fuente de verdad.
         today = utc_today()
         await mock_db.execute(
             """
             INSERT INTO daily_risk
             (date_utc, equity_open, equity_peak, realized_pnl, unrealized_pnl)
-            VALUES (?, 10000, 10000, -300, -100)
+            VALUES (?, 10000, 10000, 0, -100)
             """,
             (today,),
+        )
+        await mock_db.execute(
+            "INSERT INTO live_fills (oid, coin, dir, px, sz, closed_pnl, fee, ts_ms) "
+            "VALUES (1, 'BTC', 'Close Long', 10000, 0.03, -300.0, 0.0, ?)",
+            (int(time.time() * 1000),),
         )
         await mock_db.commit()
 
@@ -599,10 +605,15 @@ class TestPersistencia:
         """Cuando se supera el daily_loss_limit, paused_until se guarda en daily_risk."""
         today = utc_today()
         equity = 100.0
-        # Pre-poblar daily_risk con pérdida del 5% (> 2% límite)
+        # Pérdida realizada del 6% registrada como fill de cierre (> 2% límite).
         await fresh_db.execute(
             "INSERT INTO daily_risk (date_utc, equity_open, equity_peak, realized_pnl, unrealized_pnl) VALUES (?, ?, ?, ?, ?)",
-            (today, equity, equity, -6.0, 0.0),   # -6% > -2% límite
+            (today, equity, equity, 0.0, 0.0),
+        )
+        await fresh_db.execute(
+            "INSERT INTO live_fills (oid, coin, dir, px, sz, closed_pnl, fee, ts_ms) "
+            "VALUES (1, 'BTC', 'Close Long', 100, 0.06, -6.0, 0.0, ?)",
+            (int(time.time() * 1000),),
         )
         await fresh_db.commit()
 

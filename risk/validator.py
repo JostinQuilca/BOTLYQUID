@@ -275,6 +275,11 @@ class RiskValidator:
         today = utc_today()
         equity = state.account.equity
 
+        # Realized PnL del día desde live_fills (idempotente por tid) en vez del
+        # contador acumulado no idempotente de daily_risk: un fill perdido por una
+        # reconexión no contaba, y un replay lo contaba doble.
+        realized_fills = await self._realized_pnl_today(today)
+
         async with self._db.execute(
             "SELECT * FROM daily_risk WHERE date_utc = ?", (today,)
         ) as cursor:
@@ -295,7 +300,7 @@ class RiskValidator:
                 date_utc=today,
                 equity_open=equity,
                 equity_peak=equity,
-                realized_pnl=0.0,
+                realized_pnl=realized_fills if realized_fills is not None else 0.0,
                 unrealized_pnl=0.0,
                 paused_until=None,
                 kill_switch=False,
@@ -305,11 +310,28 @@ class RiskValidator:
             date_utc=row["date_utc"],
             equity_open=row["equity_open"],
             equity_peak=row["equity_peak"],
-            realized_pnl=row["realized_pnl"],
+            realized_pnl=realized_fills if realized_fills is not None else row["realized_pnl"],
             unrealized_pnl=row["unrealized_pnl"],
             paused_until=row["paused_until"],
             kill_switch=bool(row["kill_switch"]),
         )
+
+    async def _realized_pnl_today(self, today_utc: str) -> float | None:
+        """Suma el PnL realizado neto (closed_pnl - fee) de los fills de cierre de HOY
+        (UTC) desde live_fills. Idempotente (tid UNIQUE en producción). Retorna None si
+        no se pudo calcular (se usa entonces el valor almacenado como respaldo)."""
+        try:
+            async with self._db.execute(
+                "SELECT COALESCE(SUM(closed_pnl - COALESCE(fee, 0)), 0) FROM live_fills "
+                "WHERE (closed_pnl != 0 OR dir LIKE 'Close%') "
+                "AND DATE(ts_ms / 1000, 'unixepoch') = ?",
+                (today_utc,),
+            ) as cur:
+                row = await cur.fetchone()
+            return float(row[0]) if row and row[0] is not None else 0.0
+        except Exception as e:
+            logger.warning("No se pudo calcular realized_pnl desde live_fills: %s", e)
+            return None
 
     async def _check_account_limits(self, risk_state: RiskState, state: MarketState) -> None:
         # Candado duro de protección de capital ($41.00 USDC)
