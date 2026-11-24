@@ -28,6 +28,7 @@ INITIAL_CAPITAL = 42.85
 LEVERAGE = 2.0
 NOTIONAL = INITIAL_CAPITAL * LEVERAGE  # $85.70 USD
 TAKER_FEE_PCT = 0.000864               # 0.0864% (2x 0.0432%)
+SLIPPAGE_PCT = 0.0003                  # 3 bps de slippage en entradas y salidas a mercado
 LOOKBACK = 256
 PRED_LEN = 6
 SAMPLE_COUNT = 5
@@ -172,7 +173,10 @@ def run_walkforward_backtest(
         # ── SEÑAL DETECTADA: SIMULACIÓN DE EJECUCIÓN ───────────────────────────
         entry_idx = idx
         entry_ts = timestamps[entry_idx]
-        entry_price = last_close
+        # Realismo: la señal se confirma al CIERRE de la vela idx; el primer precio
+        # operable es la APERTURA de la vela siguiente, con slippage de mercado.
+        raw_entry = float(opens[entry_idx + 1])
+        entry_price = raw_entry * (1.0 + SLIPPAGE_PCT) if signal_side == "LONG" else raw_entry * (1.0 - SLIPPAGE_PCT)
 
         # Calibración TP/SL/BE adaptada al ATR por temporalidad (Plan v15)
         if interval == "15m":
@@ -203,66 +207,73 @@ def run_walkforward_backtest(
         exit_reason = None
         exit_idx = None
 
-        # Recorrer hasta 6 velas futuras
+        # Recorrer las velas futuras A PARTIR de la vela de entrada (entry_idx + 1),
+        # nunca la vela de señal (evita lookahead sobre su propio high/low).
         for step in range(PRED_LEN):
-            curr_fwd_idx = entry_idx + step
+            curr_fwd_idx = entry_idx + 1 + step
+            c_open = float(opens[curr_fwd_idx])
             c_high = highs[curr_fwd_idx]
             c_low = lows[curr_fwd_idx]
             c_close = closes[curr_fwd_idx]
 
             if signal_side == "LONG":
-                # 1. Comprobar SL vigente antes de mover a BE en esta misma vela
+                # 1. SL/BE_SL: si la vela abre por DEBAJO del stop (gap), llena peor;
+                #    y toda salida a mercado paga slippage.
                 if c_low <= current_sl:
-                    exit_price = current_sl
+                    exit_price = min(current_sl, c_open) * (1.0 - SLIPPAGE_PCT)
                     exit_reason = "BE_SL" if moved_to_be else "SL"
                     exit_idx = curr_fwd_idx
                     break
 
-                # 2. Comprobar TP alcanzado en esta vela
+                # 2. TP (orden límite: llena al precio, sin slippage)
                 if c_high >= tp_price:
                     exit_price = tp_price
                     exit_reason = "TP"
                     exit_idx = curr_fwd_idx
                     break
 
-                # 3. Activar Break-Even para siguientes velas (o cerrar si la propia vela retrocedió bajo BE al cierre)
+                # 3. Break-Even. Pesimista: si la MISMA vela ya tocó el nuevo SL
+                #    (mecha), se cierra ahí, no solo si cierra por debajo.
                 if not moved_to_be and c_high >= be_trigger_px:
                     current_sl = be_sl_px
                     moved_to_be = True
-                    if c_close <= current_sl:
-                        exit_price = current_sl
+                    if c_low <= current_sl:
+                        exit_price = min(current_sl, c_open) * (1.0 - SLIPPAGE_PCT)
                         exit_reason = "BE_SL"
                         exit_idx = curr_fwd_idx
                         break
 
             else:  # SHORT
-                # 1. Comprobar SL vigente antes de mover a BE en esta misma vela
+                # 1. SL/BE_SL: si la vela abre por ENCIMA del stop (gap), llena peor.
                 if c_high >= current_sl:
-                    exit_price = current_sl
+                    exit_price = max(current_sl, c_open) * (1.0 + SLIPPAGE_PCT)
                     exit_reason = "BE_SL" if moved_to_be else "SL"
                     exit_idx = curr_fwd_idx
                     break
 
-                # 2. Comprobar TP alcanzado en esta vela
+                # 2. TP (orden límite)
                 if c_low <= tp_price:
                     exit_price = tp_price
                     exit_reason = "TP"
                     exit_idx = curr_fwd_idx
                     break
 
-                # 3. Activar Break-Even para siguientes velas (o cerrar si la propia vela rebotó sobre BE al cierre)
+                # 3. Break-Even (pesimista con la mecha de la misma vela)
                 if not moved_to_be and c_low <= be_trigger_px:
                     current_sl = be_sl_px
                     moved_to_be = True
-                    if c_close >= current_sl:
-                        exit_price = current_sl
+                    if c_high >= current_sl:
+                        exit_price = max(current_sl, c_open) * (1.0 + SLIPPAGE_PCT)
                         exit_reason = "BE_SL"
                         exit_idx = curr_fwd_idx
                         break
 
-            # 4. Time-Stop al término de la vela 6 (step == PRED_LEN - 1)
+            # 4. Time-Stop al término de la última vela: cierre a mercado + slippage
             if step == PRED_LEN - 1:
-                exit_price = c_close
+                if signal_side == "LONG":
+                    exit_price = c_close * (1.0 - SLIPPAGE_PCT)
+                else:
+                    exit_price = c_close * (1.0 + SLIPPAGE_PCT)
                 exit_reason = "TIME_STOP"
                 exit_idx = curr_fwd_idx
                 break
