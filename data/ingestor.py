@@ -383,8 +383,11 @@ class HyperliquidIngestor:
                             alert_type="FILL",
                         )
 
-                    if self._executor:
-                        await self._executor.on_position_closed(f"Fill {dir_str}")
+                    # NOTA (Track B): el cierre de posición ya lo maneja on_fill
+                    # (llamado arriba para TODO fill). on_fill clasifica cierre
+                    # total vs parcial y pasa a FLAT solo cuando la posición queda
+                    # en 0. Llamar aquí on_position_closed de nuevo cancelaba el SL
+                    # en cierres PARCIALES y forzaba FLAT de más (doble manejo).
 
     # ── Reconciliador REST ─────────────────────────────────────────────────────
 

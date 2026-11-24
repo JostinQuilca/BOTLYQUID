@@ -337,3 +337,72 @@ class TestExecutorExecution:
         mock_exchange.cancel.assert_any_call("BTC", 111)
         assert executor._kill_switch_active is True
         assert sm.state == ExecutorState.HALTED
+
+    @pytest.mark.asyncio
+    async def test_closing_fill_in_open_unprotected_goes_flat(self):
+        """Regresión Track B: un fill de cierre en OPEN_UNPROTECTED debe cerrar
+        (ir a FLAT), NO acumularse como un partial fill de entrada."""
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.cancel.return_value = {"status": "ok"}
+        mock_exchange.bulk_cancel.return_value = {"status": "ok"}
+        mock_exchange.info.open_orders.return_value = []
+        mock_exchange.info.user_state.return_value = {"assetPositions": []}
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        await sm.transition(ExecutorState.ENTRY_PENDING, "t")
+        await sm.transition(ExecutorState.OPEN_UNPROTECTED, "t")
+        executor._filled_size = 0.001
+
+        close_fill = {"dir": "Close Long", "closedPnl": -0.05, "sz": 0.001, "tid": 1}
+        await executor.on_fill(None, 76000.0, 0.001, 777, fill_data=close_fill)
+
+        assert sm.state == ExecutorState.FLAT
+
+    @pytest.mark.asyncio
+    async def test_closing_fill_in_flat_does_not_open_entry(self):
+        """Regresión Track B: un fill de cierre con el executor en FLAT NO debe
+        abrir una 'entrada' ni colocar SL/TP."""
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.cancel.return_value = {"status": "ok"}
+        mock_exchange.bulk_cancel.return_value = {"status": "ok"}
+        mock_exchange.info.open_orders.return_value = []
+        mock_exchange.info.user_state.return_value = {"assetPositions": []}
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        assert sm.state == ExecutorState.FLAT
+
+        close_fill = {"dir": "Close Short", "closedPnl": 0.10, "sz": 0.001, "tid": 2}
+        await executor.on_fill(None, 76000.0, 0.001, 888, fill_data=close_fill)
+
+        assert sm.state == ExecutorState.FLAT
+        mock_exchange.order.assert_not_called()   # no colocó SL/TP de "entrada"
+
+    @pytest.mark.asyncio
+    async def test_partial_closing_fill_keeps_position_open(self):
+        """Regresión Track B: un cierre PARCIAL reduce el tamaño pero mantiene la
+        posición abierta y protegida (no va a FLAT)."""
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.cancel.return_value = {"status": "ok"}
+        mock_exchange.bulk_cancel.return_value = {"status": "ok"}
+        mock_exchange.info.open_orders.return_value = []
+        # REST dice que todavía queda posición (0.001)
+        mock_exchange.info.user_state.return_value = {
+            "assetPositions": [{"position": {"coin": "BTC", "szi": "0.001"}}]
+        }
+        mock_exchange.order.return_value = {
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 42}}]}},
+        }
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        approved = _make_sample_approved(OrderType.IOC)
+        executor._active_order = approved
+        await sm.transition(ExecutorState.ENTRY_PENDING, "t")
+        await sm.transition(ExecutorState.OPEN_PROTECTED, "t")
+        executor._filled_size = 0.002
+
+        close_fill = {"dir": "Close Long", "closedPnl": 0.05, "sz": 0.001, "tid": 3}
+        await executor.on_fill(None, 76000.0, 0.001, 999, fill_data=close_fill)
+
+        assert sm.state != ExecutorState.FLAT
+        assert abs(executor._filled_size - 0.001) < 1e-9

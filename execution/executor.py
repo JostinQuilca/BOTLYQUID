@@ -294,25 +294,30 @@ class HyperliquidExecutor:
         closed_pnl = float(fill_data.get("closedPnl", 0.0) or 0.0)
         is_closing_fill = dir_str.startswith("Close") or closed_pnl != 0.0
 
-        # v7: deduplicar fills de entrada (REST response + WS userEvents envían el mismo fill)
-        fill_key = f"{oid}:{fill_size:.5f}:{'close' if is_closing_fill else 'open'}"
-        if not is_closing_fill and oid > 0 and fill_key in self._processed_fill_keys:
-            logger.debug("Ignorando fill de entrada duplicado (REST+WS): %s", fill_key)
+        # Dedup de fills (entrada Y cierre): la respuesta REST y el canal WS
+        # userEvents pueden enviar el mismo fill. Se prefiere el tid (único por
+        # trade); si no hay, se cae a oid:tamaño:tipo.
+        tid = fill_data.get("tid")
+        fill_key = (
+            f"tid:{tid}" if tid is not None
+            else f"{oid}:{fill_size:.5f}:{'close' if is_closing_fill else 'open'}"
+        )
+        if fill_key in self._processed_fill_keys:
+            logger.debug("Ignorando fill duplicado (REST+WS): %s", fill_key)
             return
-        if oid > 0:
+        if tid is not None or oid > 0:
             self._processed_fill_keys.add(fill_key)
 
-        if self._sm.state == ExecutorState.OPEN_PROTECTED and is_closing_fill:
-            logger.info(
-                "Closing fill detected in OPEN_PROTECTED (dir='%s', closedPnl=%.4f). Calling on_tp_sl_trigger...",
-                dir_str,
-                closed_pnl,
-            )
-            await self.on_tp_sl_trigger("TP_OR_SL", fill_price)
+        # CORRECCIÓN (Track B): un fill de CIERRE se maneja en CUALQUIER estado y
+        # NUNCA por el camino de entrada. Antes, un fill de cierre fuera de
+        # OPEN_PROTECTED se trataba como entrada (colocaba SL/TP reduce-only contra
+        # una cuenta que se cerraba, o adoptaba un fill ajeno como entrada propia).
+        if is_closing_fill:
+            await self._handle_closing_fill(dir_str, fill_price, fill_size, closed_pnl)
             return
 
         if self._sm.state in (ExecutorState.OPEN_PROTECTED, ExecutorState.OPEN_UNPROTECTED):
-            # Partial fill adicional: acumular tamaño y re-proteger
+            # Partial fill adicional de ENTRADA: acumular tamaño y re-proteger
             self._filled_size = getattr(self, "_filled_size", 0.0) + fill_size
             logger.warning(
                 "Additional partial fill received (+%.5f BTC, total=%.5f BTC). Updating TP/SL...",
@@ -379,6 +384,43 @@ class HyperliquidExecutor:
         # Colocar Stop Loss y Take Profit automáticamente
         async with self._protect_lock:
             await self._place_tp_sl_with_retry(fill_price, fill_size)
+
+    async def _handle_closing_fill(
+        self,
+        dir_str: str,
+        fill_price: float,
+        fill_size: float,
+        closed_pnl: float,
+    ) -> None:
+        """Maneja un fill de CIERRE (parcial o total) en cualquier estado.
+
+        Nunca lo trata como entrada. Reduce el tamaño conocido y, si la posición
+        quedó plana (verificado por REST, con la estimación local como respaldo),
+        cancela residuales y pasa a FLAT. Si es un cierre PARCIAL, mantiene la
+        protección del tamaño restante.
+        """
+        self._filled_size = max(0.0, self._filled_size - fill_size)
+        logger.info(
+            "Closing fill: dir='%s' sz=%.5f @ %.2f closedPnl=%.4f (restante estimado=%.5f)",
+            dir_str, fill_size, fill_price, closed_pnl, self._filled_size,
+        )
+
+        flat = await self._verify_flat_via_rest()
+        fully_closed = flat is True or (flat is None and self._filled_size <= 1e-6)
+
+        if fully_closed:
+            await self.on_tp_sl_trigger("CLOSE_FILL", fill_price)
+            return
+
+        # Cierre PARCIAL: la posición sigue abierta → mantener/ajustar la protección.
+        logger.warning(
+            "Cierre parcial: la posición sigue abierta (~%.5f BTC). Reprotegiendo el resto.",
+            self._filled_size,
+        )
+        if self._active_order is not None and self._filled_size > 1e-6:
+            is_long = self._active_order.signal.side == SignalSide.BUY
+            signed = self._filled_size if is_long else -self._filled_size
+            await self.ensure_protected(fill_price, signed)
 
     # ── Auto-sanación (llamado por el reconciliador) ──────────────────────────
 
