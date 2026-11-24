@@ -14,6 +14,7 @@ Simula ejecución realista con:
 - Comisiones Taker: 0.0864% round-trip
 """
 
+import os
 import sys
 import time
 import requests
@@ -22,6 +23,14 @@ import pandas as pd
 import torch
 
 from kronos_engine import Kronos, KronosTokenizer, KronosPredictor
+
+# Windows: evitar UnicodeEncodeError (cp1252) al imprimir emojis con stdout redirigido.
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+try:
+    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
 INITIAL_CAPITAL = 42.85
