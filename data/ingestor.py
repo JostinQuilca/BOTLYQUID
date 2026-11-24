@@ -357,7 +357,8 @@ class HyperliquidIngestor:
                 # Si es cierre o tiene PnL cerrado
                 if "Close" in dir_str or abs(closed_pnl) > 0:
                     net_pnl = closed_pnl - fee
-                    today = date.today().isoformat()
+                    from config.settings import utc_today
+                    today = utc_today()
                     if hasattr(self, "_db_conn") and self._db_conn:
                         try:
                             await self._db_conn.execute(
@@ -500,7 +501,8 @@ class HyperliquidIngestor:
 
         # Inicializar / actualizar daily_risk en BD para el Dashboard
         if equity > 0:
-            today = date.today().isoformat()
+            from config.settings import utc_today
+            today = utc_today()
             self._db_worker.enqueue(
                 DBEvent(
                     table="daily_risk",

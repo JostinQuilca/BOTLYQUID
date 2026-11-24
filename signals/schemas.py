@@ -46,6 +46,7 @@ class VetoReason(str, Enum):
     RISK_MARGIN_DISTANCE = "RISK_MARGIN_DISTANCE"
     RISK_COOLDOWN = "RISK_COOLDOWN"
     KILL_SWITCH_ACTIVE = "KILL_SWITCH_ACTIVE"
+    SYSTEM_ERROR = "SYSTEM_ERROR"
 
 
 class SignalProposal(BaseModel):

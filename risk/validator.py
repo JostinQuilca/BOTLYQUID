@@ -18,14 +18,14 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import aiosqlite
 
-from config.settings import Settings, get_settings
+from config.settings import Settings, get_settings, stop_flag_path, utc_today
 from data.state import MarketState
-from signals.schemas import ApprovedOrder, SignalProposal, VetoReason
+from signals.schemas import ApprovedOrder, SignalProposal, SignalSide, VetoReason
 
 logger = logging.getLogger(__name__)
 
@@ -225,8 +225,8 @@ class RiskValidator:
 
     def _check_kill_switch(self) -> None:
         import os
-        # También verificar archivo físico
-        if os.path.exists("STOP_BOT.flag"):
+        # También verificar archivo físico (ruta absoluta + fallback relativo al CWD)
+        if os.path.exists(stop_flag_path()) or os.path.exists("STOP_BOT.flag"):
             self._kill_switch_active = True
         if self._kill_switch_active:
             raise VetoException(VetoReason.KILL_SWITCH_ACTIVE, "Kill switch is active")
@@ -250,7 +250,7 @@ class RiskValidator:
 
     async def _load_risk_state(self, state: MarketState) -> RiskState:
         """Carga o inicializa el estado de riesgo del día actual."""
-        today = date.today().isoformat()
+        today = utc_today()
         equity = state.account.equity
 
         async with self._db.execute(
@@ -392,7 +392,14 @@ class RiskValidator:
         except VetoException:
             raise
         except Exception as e:
-            logger.debug("Error verificando trades del dia: %s", e)
+            # Fail-closed en LIVE: si no podemos verificar el conteo diario, vetamos
+            # en vez de dejar pasar la señal con un control de riesgo roto.
+            logger.error("Error verificando trades del dia (fail-closed): %s", e)
+            if not self._shadow_mode:
+                raise VetoException(
+                    VetoReason.SYSTEM_ERROR,
+                    f"No se pudo verificar el conteo diario de trades: {e}",
+                )
 
     async def _check_loss_cooldown(self, signal: SignalProposal) -> None:
         """
@@ -465,7 +472,13 @@ class RiskValidator:
         except VetoException:
             raise
         except Exception as e:
-            logger.debug("Error comprobando cooldown: %s", e)
+            # Fail-closed en LIVE: si no podemos verificar el cooldown, vetamos.
+            logger.error("Error comprobando cooldown (fail-closed): %s", e)
+            if not self._shadow_mode:
+                raise VetoException(
+                    VetoReason.SYSTEM_ERROR,
+                    f"No se pudo verificar el cooldown de pérdidas: {e}",
+                )
 
     def _calculate_size(
         self,

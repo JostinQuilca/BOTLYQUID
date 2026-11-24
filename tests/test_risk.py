@@ -27,6 +27,7 @@ from pydantic import SecretStr
 from data.state import AccountState, AssetContext, L2Book, L2Level, MarketState, Trade
 from risk.validator import RiskValidator, VetoException
 from signals.schemas import MarketRegime, OrderType, SignalProposal, SignalSide
+from config.settings import utc_today
 
 
 def make_test_settings():
@@ -66,6 +67,13 @@ async def mock_db():
             paused_until REAL,
             kill_switch INTEGER NOT NULL DEFAULT 0,
             updated_at REAL NOT NULL DEFAULT (unixepoch('now', 'subsec'))
+        );
+        CREATE TABLE IF NOT EXISTS live_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            oid INTEGER, coin TEXT, dir TEXT,
+            px REAL, sz REAL, closed_pnl REAL DEFAULT 0.0,
+            fee REAL DEFAULT 0.0, ts_ms INTEGER,
+            created_at REAL DEFAULT (unixepoch('now', 'subsec'))
         );
     """)
     await db.commit()
@@ -188,7 +196,7 @@ class TestAccountLimits:
         state = make_healthy_state(equity=10_000.0)
 
         # Insertar estado de riesgo del dÃ­a con pÃ©rdida del 4%
-        today = date.today().isoformat()
+        today = utc_today()
         await mock_db.execute(
             """
             INSERT INTO daily_risk
@@ -212,7 +220,7 @@ class TestAccountLimits:
         # Equity actual = 8,500 (15% de caÃ­da desde pico de 10,000)
         state = make_healthy_state(equity=8_500.0)
 
-        today = date.today().isoformat()
+        today = utc_today()
         await mock_db.execute(
             """
             INSERT INTO daily_risk
@@ -248,7 +256,7 @@ class TestAccountLimits:
     async def test_capital_floor_protects_capital(self, mock_db):
         """Si equity < 41.00 USDC con cuenta real (open >= 41), se activa candado de capital."""
         state = make_healthy_state(equity=40.50)
-        today = date.today().isoformat()
+        today = utc_today()
         await mock_db.execute(
             """
             INSERT INTO daily_risk
@@ -574,7 +582,7 @@ class TestPersistencia:
     @pytest.mark.asyncio
     async def test_daily_loss_limit_persiste_paused_until(self, fresh_db):
         """Cuando se supera el daily_loss_limit, paused_until se guarda en daily_risk."""
-        today = date.today().isoformat()
+        today = utc_today()
         equity = 100.0
         # Pre-poblar daily_risk con pérdida del 5% (> 2% límite)
         await fresh_db.execute(
@@ -602,7 +610,7 @@ class TestPersistencia:
     @pytest.mark.asyncio
     async def test_max_drawdown_persiste_kill_switch(self, fresh_db):
         """Cuando se supera max_drawdown, kill_switch = 1 queda en daily_risk."""
-        today = date.today().isoformat()
+        today = utc_today()
         equity_open = 100.0
         equity_peak = 100.0
         await fresh_db.execute(
@@ -679,6 +687,53 @@ class TestPersistencia:
             await validator.validate(signal, state, shadow_mode=False)
         assert exc_info.value.reason.value == "RISK_COOLDOWN"
         assert "Racha de 3 pérdidas consecutivas" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_v7_same_direction_cooldown_15min(self, fresh_db):
+        """v7 Regla 2: una pérdida reciente en la misma dirección veta por 15 min.
+
+        Regresión: antes `SignalSide` no se importaba en risk/validator.py, así que
+        esta regla lanzaba NameError que el `except` se tragaba y el cooldown NUNCA
+        se aplicaba. Esta prueba falla sin el import y pasa con él.
+        """
+        validator = RiskValidator(fresh_db, sz_decimals=4, min_notional_usd=10.0, settings=make_live_settings())
+        state = _make_state_risk(equity=100.0)
+        now_ms = int(time.time() * 1000)
+
+        # UNA sola pérdida reciente al cerrar un Long (no dispara la regla de racha de 3).
+        await fresh_db.execute(
+            "INSERT INTO live_fills (oid, coin, dir, px, sz, closed_pnl, ts_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (100, "BTC", "Close Long", 80000.0, 0.001, -0.10, now_ms - 60_000),   # hace 1 min
+        )
+        await fresh_db.commit()
+
+        # Un nuevo BUY (misma dirección que el Long perdido) debe ser vetado.
+        buy_signal = _make_signal_for_risk(side=SignalSide.BUY)
+        with pytest.raises(VetoException) as exc_info:
+            await validator.validate(buy_signal, state, shadow_mode=False)
+        assert exc_info.value.reason.value == "RISK_COOLDOWN"
+
+        # Un SELL (dirección opuesta) NO debe ser vetado por este cooldown.
+        sell_signal = _make_signal_for_risk(side=SignalSide.SELL)
+        approved = await validator.validate(sell_signal, state, shadow_mode=False)
+        assert approved is not None
+
+    @pytest.mark.asyncio
+    async def test_db_error_fails_closed_in_live(self, fresh_db):
+        """Fail-closed: si falla una verificación de riesgo en BD (p.ej. tabla
+        ausente), en modo LIVE la señal se VETA (SYSTEM_ERROR) en vez de pasar
+        con un control de riesgo roto."""
+        # Romper el esquema: sin live_fills, el cooldown/conteo diario fallan.
+        await fresh_db.execute("DROP TABLE live_fills")
+        await fresh_db.commit()
+
+        validator = RiskValidator(fresh_db, sz_decimals=4, min_notional_usd=10.0, settings=make_live_settings())
+        signal = _make_signal_for_risk(side=SignalSide.BUY)
+        state = _make_state_risk(equity=100.0)
+
+        with pytest.raises(VetoException) as exc_info:
+            await validator.validate(signal, state, shadow_mode=False)
+        assert exc_info.value.reason.value == "SYSTEM_ERROR"
 
 
 class TestApplySizeMultiplier:

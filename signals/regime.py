@@ -25,7 +25,9 @@ from signals.schemas import MarketRegime
 
 logger = logging.getLogger(__name__)
 
-EVENTS_CALENDAR_PATH = Path("config/events_calendar.yaml")
+# Ruta resuelta relativa a ESTE archivo (no al CWD) para que funcione bajo
+# Docker/systemd/Fly, donde el directorio de trabajo puede ser distinto.
+EVENTS_CALENDAR_PATH = Path(__file__).resolve().parent.parent / "config" / "events_calendar.yaml"
 
 # ── Clasificador ───────────────────────────────────────────────────────────────
 
@@ -54,15 +56,41 @@ class RegimeClassifier:
     def _load_events(self) -> list[dict[str, Any]]:
         """Carga el calendario de eventos de alto impacto desde YAML."""
         if not EVENTS_CALENDAR_PATH.exists():
-            logger.warning("Events calendar not found at %s", EVENTS_CALENDAR_PATH)
+            logger.error(
+                "Events calendar NO ENCONTRADO en %s — el blackout de eventos "
+                "(FOMC/CPI/NFP) está DESACTIVADO. Trading sin protección de eventos.",
+                EVENTS_CALENDAR_PATH,
+            )
             return []
         try:
             with open(EVENTS_CALENDAR_PATH) as f:
                 data = yaml.safe_load(f)
-            return data.get("events", [])
+            events = data.get("events", []) if isinstance(data, dict) else []
         except Exception:
             logger.exception("Failed to load events calendar")
             return []
+
+        # Aviso de calendario vencido: si no hay ningún evento futuro, el blackout
+        # nunca se dispara (protección silenciosamente inútil). Hay que refrescarlo.
+        now = datetime.now(timezone.utc)
+        has_future = False
+        for ev in events:
+            try:
+                ev_dt = datetime.fromisoformat(ev["datetime_utc"])
+                if ev_dt.tzinfo is None:
+                    ev_dt = ev_dt.replace(tzinfo=timezone.utc)
+                if ev_dt >= now:
+                    has_future = True
+                    break
+            except (KeyError, ValueError):
+                continue
+        if events and not has_future:
+            logger.error(
+                "Events calendar VENCIDO (%d eventos, ninguno futuro) en %s — "
+                "el blackout de eventos no se disparará. Actualiza el calendario.",
+                len(events), EVENTS_CALENDAR_PATH,
+            )
+        return events
 
     @property
     def current_regime(self) -> MarketRegime:

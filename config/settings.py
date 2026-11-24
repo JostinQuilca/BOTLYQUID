@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Literal
 
@@ -133,3 +134,28 @@ def get_boot_epoch() -> float:
     with open(boot_epoch_path, "w") as f:
         f.write(str(epoch))
     return epoch
+
+
+def project_root() -> str:
+    """Ruta absoluta de la raíz del proyecto (donde vive main.py)."""
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def stop_flag_path() -> str:
+    """Ruta absoluta del archivo STOP_BOT.flag en la raíz del proyecto.
+
+    CORRECCIÓN: antes el kill switch buscaba 'STOP_BOT.flag' relativo al directorio
+    de trabajo. En Docker/systemd/Fly el proceso puede arrancar desde otro CWD y la
+    3ª fuente del kill switch (el archivo flag) nunca se encontraba.
+    """
+    return os.path.join(project_root(), "STOP_BOT.flag")
+
+
+def utc_today() -> str:
+    """Fecha de hoy en UTC (YYYY-MM-DD).
+
+    CORRECCIÓN: el estado de riesgo diario (daily_risk) debe usar SIEMPRE la fecha
+    UTC. Mezclar date.today() (hora local) con consultas en UTC desplazaba la
+    frontera del día en máquinas no-UTC, permitiendo resetear el límite diario.
+    """
+    return datetime.now(timezone.utc).date().isoformat()

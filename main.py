@@ -226,8 +226,8 @@ async def main() -> None:
         await set_bot_state(db, BotProcessState.HALTED, {"reason": "kill_switch"})
 
     async def pause_fn(seconds: int) -> None:
-        from datetime import date
-        today = date.today().isoformat()
+        from config.settings import utc_today
+        today = utc_today()
         paused_until = time.time() + seconds
         equity_now = market_state.account.equity
         try:

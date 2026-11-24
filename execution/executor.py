@@ -707,9 +707,12 @@ class HyperliquidExecutor:
     async def _monitor_kill_flag(self) -> None:
         """Monitorea el archivo STOP_BOT.flag cada 5 segundos."""
         import os
+        from config.settings import stop_flag_path
+        flag_abs = stop_flag_path()
         while not self._kill_switch_active:
             await asyncio.sleep(5)
-            if os.path.exists("STOP_BOT.flag"):
+            # Ruta absoluta (raíz del proyecto) + fallback relativo al CWD por compat.
+            if os.path.exists(flag_abs) or os.path.exists("STOP_BOT.flag"):
                 await self.kill_switch("STOP_BOT.flag detected")
                 break
 
