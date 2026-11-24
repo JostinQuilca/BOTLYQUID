@@ -14,12 +14,13 @@ Correcciones integradas:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import aiosqlite
 
@@ -82,6 +83,7 @@ class RiskValidator:
         sz_decimals: int = 5,        # szDecimals de BTC en Hyperliquid
         min_notional_usd: float = 10.0,
         settings: Settings | None = None,
+        on_kill: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._db = db
         self._settings = settings if settings is not None else get_settings()
@@ -89,6 +91,11 @@ class RiskValidator:
         self._min_notional_usd = min_notional_usd
         self._kill_switch_active = False
         self._shadow_mode = False  # set during validate()
+        # Callback para cerrar la posición en el executor cuando se active el kill
+        # switch (límite diario / drawdown / candado de capital). Antes no existía:
+        # el kill switch del validador solo marcaba un flag y NO cerraba nada.
+        self._on_kill = on_kill
+        self._kill_task: asyncio.Task[None] | None = None
 
     # ── API pública ────────────────────────────────────────────────────────────
 
@@ -184,9 +191,24 @@ class RiskValidator:
         )
 
     def activate_kill_switch(self, reason: str = "Manual") -> None:
-        """Activa el kill switch de forma permanente hasta reinicio manual."""
+        """Activa el kill switch de forma permanente hasta reinicio manual.
+
+        CORRECCIÓN (Track B): además de marcar el flag, dispara el cierre REAL de la
+        posición en el executor (si se inyectó on_kill). Antes, un kill switch por
+        límite diario/drawdown con una posición abierta NO la cerraba.
+        """
+        already = self._kill_switch_active
         self._kill_switch_active = True
         logger.critical("KILL SWITCH ACTIVATED: %s", reason)
+        if self._on_kill is not None and not already:
+            try:
+                loop = asyncio.get_running_loop()
+                self._kill_task = loop.create_task(self._on_kill(reason))
+            except RuntimeError:
+                logger.error(
+                    "activate_kill_switch sin event loop activo: no se pudo "
+                    "disparar el cierre de la posición (%s)", reason,
+                )
 
     def apply_size_multiplier(self, approved: ApprovedOrder, multiplier: float) -> ApprovedOrder:
         """

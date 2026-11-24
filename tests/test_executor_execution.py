@@ -281,3 +281,59 @@ class TestExecutorExecution:
         mock_exchange.order.assert_called_once()
         args, kwargs = mock_exchange.order.call_args
         assert args[3] == float(round(75626.0 * 0.9990))
+
+    @pytest.mark.asyncio
+    async def test_emergency_close_runs_market_close_even_from_halted(self):
+        """Regresión Track B: aunque la transición a CLOSING sea inválida (estado
+        HALTED), el cierre a mercado DEBE ejecutarse igual (antes no se ejecutaba)."""
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.market_close.return_value = {"status": "ok", "response": {}}
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        await sm.force_halt("test")  # CLOSING es inválido desde HALTED
+        assert sm.state == ExecutorState.HALTED
+
+        await executor._emergency_close(0.001, "test")
+
+        mock_exchange.market_close.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_emergency_close_halts_when_close_not_confirmed(self):
+        """Si market_close falla y REST confirma que la posición sigue abierta,
+        el executor NO pasa a FLAT: queda en HALTED."""
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.market_close.return_value = {"status": "err", "response": "boom"}
+        mock_exchange.info.user_state.return_value = {
+            "assetPositions": [{"position": {"coin": "BTC", "szi": "0.001"}}]
+        }
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        await sm.transition(ExecutorState.ENTRY_PENDING, "t")
+        await sm.transition(ExecutorState.OPEN_PROTECTED, "t")
+
+        await executor._emergency_close(0.001, "test")
+
+        assert sm.state == ExecutorState.HALTED
+
+    @pytest.mark.asyncio
+    async def test_kill_switch_closes_before_cancelling_orders(self):
+        """Regresión Track B: el kill switch CIERRA (y confirma por REST) antes de
+        cancelar las órdenes de protección, y queda en HALTED."""
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.market_close.return_value = {"status": "ok", "response": {}}
+        mock_exchange.cancel.return_value = {"status": "ok"}
+        mock_exchange.bulk_cancel.return_value = {"status": "ok"}
+        mock_exchange.info.open_orders.return_value = []
+        mock_exchange.info.user_state.return_value = {"assetPositions": []}
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        await sm.transition(ExecutorState.ENTRY_PENDING, "t")
+        await sm.transition(ExecutorState.OPEN_PROTECTED, "t")
+        executor._active_sl_oid = 111
+
+        await executor.kill_switch("test")
+
+        mock_exchange.market_close.assert_called()
+        mock_exchange.cancel.assert_any_call("BTC", 111)
+        assert executor._kill_switch_active is True
+        assert sm.state == ExecutorState.HALTED

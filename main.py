@@ -217,7 +217,10 @@ async def main() -> None:
             logger.exception("Failed to initialize executor — falling back to shadow mode")
             settings.shadow_mode = True  # type: ignore[misc]
 
-    risk_validator = RiskValidator(db)
+    risk_validator = RiskValidator(
+        db,
+        on_kill=(executor.kill_switch if executor else None),
+    )
 
     # ── 5. Telegram ────────────────────────────────────────────────────────────
     async def kill_switch_fn() -> None:

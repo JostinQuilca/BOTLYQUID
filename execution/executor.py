@@ -662,20 +662,95 @@ class HyperliquidExecutor:
     # ── Cierre de emergencia ───────────────────────────────────────────────────
 
     async def _emergency_close(self, size: float, reason: str) -> None:
-        """Cierra la posición a mercado inmediatamente."""
+        """Cierra la posición a mercado inmediatamente.
+
+        CORRECCIÓN (Track B): el cierre a mercado se intenta PRIMERO (con
+        reintentos y verificación por REST), y la transición de estado va DESPUÉS
+        en su propio try. Antes, un error de la máquina de estados (p.ej. intentar
+        CLOSING desde HALTED/FLAT) abortaba el bloque entero y market_close NUNCA
+        se ejecutaba, dejando la posición abierta y desprotegida.
+        """
         logger.critical("EMERGENCY CLOSE: size=%.5f, reason=%s", size, reason)
 
+        # Transición a CLOSING: útil para la auditoría, NO crítica. Si falla, se
+        # cierra igual.
         try:
             await self._sm.transition(ExecutorState.CLOSING, f"Emergency: {reason}")
+        except InvalidTransitionError as e:
+            logger.warning("No se pudo transicionar a CLOSING (%s); se cierra igual.", e)
 
-            result = await asyncio.to_thread(self._exchange.market_close, self._symbol)
-            logger.critical("Emergency close result: %s", result)
+        closed = await self._close_at_market_with_retries(reason)
 
-            await self._sm.transition(ExecutorState.FLAT, "Emergency close complete")
-
-        except Exception:
-            logger.exception("Emergency close FAILED")
+        if closed:
+            try:
+                await self._sm.transition(ExecutorState.FLAT, "Emergency close complete")
+            except InvalidTransitionError:
+                await self._sm.force_halt("Emergency close OK pero estado inconsistente")
+        else:
+            logger.critical("EMERGENCY CLOSE NO CONFIRMADO tras reintentos — HALT")
             await self._sm.force_halt(f"Emergency close failed: {reason}")
+            await self._alert_critical(
+                f"🚨 *CIERRE DE EMERGENCIA FALLÓ*\n"
+                f"Motivo: `{reason}`\n"
+                f"La posición puede seguir ABIERTA. Revisa el exchange de inmediato."
+            )
+
+    async def _close_at_market_with_retries(self, reason: str, retries: int = 3) -> bool:
+        """Cierra a mercado con reintentos y verifica por REST que la posición sea 0.
+
+        Retorna True solo si el cierre quedó confirmado: posición plana por REST, o
+        bien market_close no reportó error cuando no se pudo verificar por REST.
+        """
+        for attempt in range(1, retries + 1):
+            close_errored = False
+            try:
+                result = await asyncio.to_thread(self._exchange.market_close, self._symbol)
+                logger.critical("market_close intento %d/%d: %s", attempt, retries, result)
+                if isinstance(result, dict) and result.get("status") == "err":
+                    close_errored = True
+                    logger.error("market_close devolvió error: %s", result.get("response"))
+            except Exception:
+                close_errored = True
+                logger.exception("market_close intento %d lanzó excepción", attempt)
+
+            flat = await self._verify_flat_via_rest()
+            if flat is True:
+                return True
+            if flat is None and not close_errored:
+                # No se pudo verificar por REST, pero el cierre no reportó error:
+                # se acepta como mejor esfuerzo.
+                return True
+            if attempt < retries:
+                await asyncio.sleep(0.5)
+
+        return (await self._verify_flat_via_rest()) is True
+
+    async def _verify_flat_via_rest(self) -> bool | None:
+        """True si la posición del símbolo es ~0 según el exchange, False si hay
+        posición, None si no se pudo verificar (conservador: no asumir nada)."""
+        try:
+            info_client = getattr(self._exchange, "info", None)
+            if info_client is None or not hasattr(info_client, "user_state"):
+                return None
+            st = await asyncio.to_thread(info_client.user_state, self._settings.hl_main_address)
+            if not isinstance(st, dict):
+                return None
+            for ap in st.get("assetPositions", []):
+                pos = ap.get("position", {}) if isinstance(ap, dict) else {}
+                if pos.get("coin") == self._symbol:
+                    return abs(float(pos.get("szi", 0.0) or 0.0)) < 1e-6
+            return True
+        except Exception:
+            logger.exception("No se pudo verificar la posición por REST")
+            return None
+
+    async def _alert_critical(self, msg: str) -> None:
+        """Envía una alerta crítica a Telegram si hay alerter (best-effort)."""
+        if self._alerter:
+            try:
+                await self._alerter.send(msg, alert_type="CRITICAL")
+            except Exception:
+                logger.exception("No se pudo enviar alerta crítica")
 
     # ── Kill Switch ────────────────────────────────────────────────────────────
 
@@ -689,20 +764,27 @@ class HyperliquidExecutor:
 
         await self._sm.force_halt(reason)
 
-        try:
-            # Cancelar todas las órdenes abiertas
-            await self._cancel_all_symbol_orders()
-            logger.info("All orders cancelled")
+        # CORRECCIÓN (Track B): cerrar PRIMERO (con reintentos + verificación) y
+        # cancelar el resto de órdenes SOLO si el cierre quedó confirmado. Antes se
+        # cancelaba el SL antes de cerrar: si el cierre fallaba, la posición quedaba
+        # abierta y SIN stop.
+        closed = await self._close_at_market_with_retries(reason)
 
-            # Cerrar posición si existe
+        if closed:
             try:
-                await asyncio.to_thread(self._exchange.market_close, self._symbol)
-                logger.info("Position closed at market")
+                await self._cancel_all_symbol_orders()
+                logger.info("Órdenes canceladas tras cierre confirmado")
             except Exception:
-                logger.exception("Failed to close position during kill switch")
-
-        except Exception:
-            logger.exception("Kill switch execution error")
+                logger.exception("Error cancelando órdenes tras kill switch")
+        else:
+            logger.critical(
+                "KILL SWITCH: cierre NO confirmado — se mantiene el SL y se alerta"
+            )
+            await self._alert_critical(
+                f"🚨 *KILL SWITCH: EL CIERRE FALLÓ*\n"
+                f"Motivo: `{reason}`\n"
+                f"Mantengo el SL puesto. La posición puede seguir ABIERTA. Revisa el exchange YA."
+            )
 
     async def _monitor_kill_flag(self) -> None:
         """Monitorea el archivo STOP_BOT.flag cada 5 segundos."""

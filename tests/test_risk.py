@@ -13,6 +13,7 @@ Incluye tests especÃ­ficos para:
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 import time
@@ -184,6 +185,20 @@ class TestKillSwitch:
             await validator.validate(make_valid_signal(), state)
 
         assert exc_info.value.reason.value == "KILL_SWITCH_ACTIVE"
+
+    @pytest.mark.asyncio
+    async def test_activate_kill_switch_triggers_on_kill(self, mock_db):
+        """Track B: activate_kill_switch dispara el cierre real vía on_kill
+        (antes solo marcaba un flag y no cerraba la posición)."""
+        called = {}
+
+        async def fake_kill(reason):
+            called["reason"] = reason
+
+        validator = RiskValidator(mock_db, settings=make_test_settings(), on_kill=fake_kill)
+        validator.activate_kill_switch("drawdown test")
+        await asyncio.sleep(0.01)   # dejar correr la task programada
+        assert called.get("reason") == "drawdown test"
 
 
 # â”€â”€ Tests de LÃ­mites de Cuenta â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
