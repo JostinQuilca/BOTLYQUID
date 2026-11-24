@@ -522,7 +522,7 @@ class TestSmartMoneyFVGLong:
         assert result.order_type == OrderType.IOC, "SmartMoneyFVG debe usar IOC para ejecución inmediata"
         assert result.stop_loss < result.proposed_price, "SL debe estar debajo del precio"
         assert result.take_profit > result.proposed_price, "TP debe estar encima del precio"
-        assert result.expected_r >= 1.25, "R:R mínimo 1.25:1"
+        assert result.expected_r >= 1.9, "R:R objetivo 2:1 (Track A)"
         assert result.confidence > 0.0
 
     def test_bullish_sl_distance_floor(self):
@@ -578,7 +578,7 @@ class TestSmartMoneyFVGShort:
         assert result.order_type == OrderType.IOC, "SmartMoneyFVG debe usar IOC para ejecución inmediata"
         assert result.stop_loss > result.proposed_price, "SL debe estar encima del precio"
         assert result.take_profit < result.proposed_price, "TP debe estar debajo del precio"
-        assert result.expected_r >= 1.25
+        assert result.expected_r >= 1.9
 
     def test_bearish_sl_distance_floor(self):
         """El SL distance debe ser al menos 0.8 * atr_5m (SHORT)."""

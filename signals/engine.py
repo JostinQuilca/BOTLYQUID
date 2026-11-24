@@ -58,6 +58,24 @@ MIN_SIGNAL_GAP_SECONDS = 1500.0
 # Confianza mínima para que una señal pase al ejecutor
 MIN_CONFIDENCE = 0.68
 
+# ── Economía (Track A): comisiones y objetivo de reward:risk ──────────────────
+# Comisión ida+vuelta (taker) en Hyperliquid ≈ 2 x 0.0432%.
+ROUNDTRIP_FEE_PCT = 0.000864
+# Objetivo de reward:risk (TP = RR_TARGET * SL). Con R:R 1.3-1.55 y estas comisiones
+# la estrategia necesitaba ~48-57% de aciertos (real ~27%); con R:R 2.0 el break-even
+# baja a ~43%. No garantiza ganar, pero elimina la pérdida estructural.
+RR_TARGET = 2.0
+# R neto mínimo exigido tras comisiones para aceptar una señal.
+MIN_NET_R = 1.5
+
+
+def _net_expected_r(sl_dist: float, tp_dist: float, price: float) -> float:
+    """R neto esperado en una operación ganadora, descontando la comisión ida+vuelta."""
+    if sl_dist <= 0 or price <= 0:
+        return 0.0
+    fee = price * ROUNDTRIP_FEE_PCT
+    return (tp_dist - fee) / sl_dist
+
 
 # ── Helpers técnicos ───────────────────────────────────────────────────────────
 
@@ -295,10 +313,12 @@ class SmartMoneyFVGReversal:
                 sl_dist = max(min_sl_dist, min(raw_sl_dist, max_sl_dist))
                 sl_price = mid - sl_dist
 
-                # Take Profit corto de alta tasa de acierto (mínimo 0.32% ~ $245 en BTC)
-                tp_dist = max(sl_dist * 1.3, mid * 0.0032)
+                # Take Profit con R:R objetivo (TP = RR_TARGET * SL) — Track A
+                tp_dist = sl_dist * RR_TARGET
                 tp_price = mid + tp_dist
                 effective_r = round(tp_dist / sl_dist, 2)
+                if _net_expected_r(sl_dist, tp_dist, mid) < MIN_NET_R:
+                    return None
 
                 confidence = round(
                     min(0.72 + kz_confidence_bonus + min(obi_val / 0.5, 0.15), 0.95),
@@ -355,10 +375,12 @@ class SmartMoneyFVGReversal:
                 sl_dist = max(min_sl_dist, min(raw_sl_dist, max_sl_dist))
                 sl_price = mid + sl_dist
 
-                # Take Profit corto de alta tasa de acierto (mínimo 0.32% ~ $245 en BTC)
-                tp_dist = max(sl_dist * 1.3, mid * 0.0032)
+                # Take Profit con R:R objetivo (TP = RR_TARGET * SL) — Track A
+                tp_dist = sl_dist * RR_TARGET
                 tp_price = mid - tp_dist
                 effective_r = round(tp_dist / sl_dist, 2)
+                if _net_expected_r(sl_dist, tp_dist, mid) < MIN_NET_R:
+                    return None
 
                 confidence = round(
                     min(0.72 + kz_confidence_bonus + min(abs(obi_val) / 0.5, 0.15), 0.95),
@@ -480,8 +502,10 @@ class TrendMomentumV4:
         # SL calibrado v9: entre 0.25% (~$190) y 0.35% (~$265) del precio
         min_sl_dist = max(0.9 * atr_5m, mid * 0.0025)
         sl_dist = min(min_sl_dist, mid * 0.0035)
-        tp_dist = max(sl_dist * 1.4, mid * 0.0035)
+        tp_dist = sl_dist * self.RR_RATIO    # Track A: usa RR_RATIO (2.0); antes 1.4
         effective_r = round(tp_dist / sl_dist, 2)
+        if _net_expected_r(sl_dist, tp_dist, mid) < MIN_NET_R:
+            return None
 
         # Volumen actual vs promedio
         recent_volume = candles[-1].volume
@@ -758,13 +782,17 @@ class KronosFoundationStrategy:
 
         if step_minutes == 15:
             sl_pct = max(0.0038, min(1.2 * atr_pct, 0.0048))
-            tp_pct = max(sl_pct * 1.55, min(abs(proj_ret) * 1.30, 0.0080))
+            # Track A: piso de TP = RR_TARGET * SL (antes 1.55x); cap sube a 1.0%.
+            tp_pct = max(sl_pct * RR_TARGET, min(abs(proj_ret) * 1.30, 0.010))
         else:
             sl_pct = max(0.0026, min(1.3 * atr_pct, 0.0035))
-            tp_pct = max(sl_pct * 1.55, min(abs(proj_ret) * 1.25, 0.0060))
+            tp_pct = max(sl_pct * RR_TARGET, min(abs(proj_ret) * 1.25, 0.0080))
 
         sl_dist = mid * sl_pct
         tp_dist = mid * tp_pct
+        if _net_expected_r(sl_dist, tp_dist, mid) < MIN_NET_R:
+            logger.info("Kronos (%s): R neto < %.2f tras fees — señal descartada", freq_str, MIN_NET_R)
+            return None
 
         if is_long:
             side = SignalSide.BUY
