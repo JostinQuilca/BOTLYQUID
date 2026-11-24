@@ -222,7 +222,7 @@ class SmartMoneyFVGReversal:
         c_prev = eval_candles[-2]
 
         # ── C.2. Estructura previa (swing high/low) ───────────────────────────
-        struct_candles = candles[-self.MIN_CANDLES:-self.FVG_SEARCH_WINDOW]
+        struct_candles = eval_candles[-self.MIN_CANDLES:-self.FVG_SEARCH_WINDOW]
         if not struct_candles:
             return None
         swing_high = max(c.high for c in struct_candles)
@@ -230,7 +230,9 @@ class SmartMoneyFVGReversal:
 
         # ── C.3. Escanear FVGs en la ventana reciente ─────────────────────────
         # Ventana: las últimas FVG_SEARCH_WINDOW+2 velas (excluida la actual)
-        recent = candles[-(self.FVG_SEARCH_WINDOW + 2):-1]
+        # Track A p2: anclar a eval_candles (no a candles) para no mezclar la vela
+        # en formación con las cerradas (repainting intra-minuto).
+        recent = eval_candles[-(self.FVG_SEARCH_WINDOW + 2):-1]
 
         bullish_fvg: tuple[float, float] | None = None   # (bottom=c0.high, top=c2.low)
         bearish_fvg: tuple[float, float] | None = None   # (bottom=c2.high, top=c0.low)
@@ -296,7 +298,7 @@ class SmartMoneyFVGReversal:
 
             # Confirmación de estructura: precio respeta el swing high
             # (precio llegó al nivel O el pullback está por encima del swing low → tendencia alcista sana)
-            recent_10 = candles[-10:]
+            recent_10 = eval_candles[-10:]
             structure_ok = (
                 max(c.high for c in recent_10) >= swing_high * 0.999
                 or c_now.low > swing_low
@@ -358,7 +360,7 @@ class SmartMoneyFVGReversal:
 
             # Confirmación de estructura: precio respeta el swing low
             # (precio llegó al nivel O el retroceso está por debajo del swing high → tendencia bajista sana)
-            recent_10 = candles[-10:]
+            recent_10 = eval_candles[-10:]
             structure_ok = (
                 min(c.low for c in recent_10) <= swing_low * 1.001
                 or c_now.high < swing_high
@@ -507,8 +509,10 @@ class TrendMomentumV4:
         if _net_expected_r(sl_dist, tp_dist, mid) < MIN_NET_R:
             return None
 
-        # Volumen actual vs promedio
-        recent_volume = candles[-1].volume
+        # Volumen de la última vela CERRADA vs promedio. candles[-1] suele estar en
+        # formación: su volumen es parcial y daría un filtro sesgado por el minuto en
+        # curso (al principio del minuto casi nunca pasa, al final casi siempre).
+        recent_volume = candles[-2].volume if len(candles) >= 2 else candles[-1].volume
         avg_vol = _avg_volume(candles, 20)
         volume_ok = avg_vol > 0 and recent_volume > (self.VOLUME_MULTIPLIER * avg_vol)
 
