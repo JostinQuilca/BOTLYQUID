@@ -87,13 +87,38 @@ class HyperliquidExecutor:
         self._entry_time: float = 0.0         # Tiempo de apertura de posición
         self.last_order_filled: bool = False  # Flag indicando si la última orden se llenó
         self._processed_fill_keys: set[str] = set()  # v7: dedup fills REST vs WS
-
-        # Monitorear archivo STOP_BOT.flag
-        asyncio.get_event_loop().create_task(self._monitor_kill_flag())
+        # El monitor de STOP_BOT.flag se arranca con start_kill_flag_monitor() desde
+        # main() (requiere un event loop activo). Antes se creaba en __init__ con
+        # get_event_loop(), dejando la task sin referencia (riesgo de GC) y generando
+        # warnings cuando no había loop corriendo.
+        self._kill_flag_task: asyncio.Task[None] | None = None
 
     def set_alerter(self, alerter: Any) -> None:
         """Asigna o actualiza el alerter de Telegram."""
         self._alerter = alerter
+
+    def _clear_active_order(self) -> None:
+        """Limpia la orden de entrada activa en caminos SIN fill (timeout / no-fill /
+        error), para que un fill tardío o la reconciliación no reutilicen un
+        SL/TP/lado obsoletos de una orden ya abandonada."""
+        self._active_order = None
+        self._active_entry_cloid = None
+
+    def start_kill_flag_monitor(self) -> None:
+        """Arranca (una sola vez) el monitor del archivo STOP_BOT.flag.
+
+        Debe llamarse con un event loop activo (desde main()). Conserva la
+        referencia a la task para que no la recoja el recolector de basura.
+        """
+        if self._kill_flag_task is not None and not self._kill_flag_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("start_kill_flag_monitor() sin event loop activo; no se arrancó")
+            return
+        self._kill_flag_task = loop.create_task(self._monitor_kill_flag())
+        logger.info("Monitor de STOP_BOT.flag arrancado")
 
     # ── Generación de cloid (CORRECCIÓN #2) ───────────────────────────────────
 
@@ -215,6 +240,7 @@ class HyperliquidExecutor:
                 logger.info("ALO order timed out after %.0fs, cancelling...", self.ALO_TIMEOUT_S)
                 await self._cancel_order(cloid)
                 await self._sm.transition(ExecutorState.FLAT, "ALO timeout - cancelled")
+                self._clear_active_order()
                 if self._alerter:
                     await self._alerter.send(
                         f"⏱ *ORDEN ALO CANCELADA*\n"
@@ -266,6 +292,7 @@ class HyperliquidExecutor:
             if not filled:
                 logger.info("IOC order did not fill immediately — returning to FLAT")
                 await self._sm.transition(ExecutorState.FLAT, "IOC cancelled (no fill)")
+                self._clear_active_order()
                 if self._alerter:
                     await self._alerter.send(
                         f"⚠️ *ORDEN NO LLENADA*\n"
@@ -506,22 +533,58 @@ class HyperliquidExecutor:
         sl_side = not is_buy_position
         tp_side = not is_buy_position
 
+        # cloids deterministas para SL/TP: un reintento tras timeout no duplica la
+        # orden (idempotencia) y permite emparejar fills con su orden.
+        base_id = self._active_order.signal.signal_id if self._active_order else f"reconcile:{entry_price:.0f}"
+        sl_cloid = self._make_cloid(f"{base_id}:sl")
+        tp_cloid = self._make_cloid(f"{base_id}:tp")
+
+        # ── Prioridad ABSOLUTA: el Stop Loss, con deadline real (SL_CONFIRM_TIMEOUT_S) ──
+        sl_placed = False
         for attempt in range(1, self.SL_MAX_RETRIES + 1):
             try:
-                # 1. Colocar Stop Loss
-                sl_res = await asyncio.to_thread(
-                    self._exchange.order,
-                    self._symbol,
-                    sl_side,
-                    fill_size,
-                    stop_price,
-                    {"trigger": {"isMarket": True, "triggerPx": stop_price, "tpsl": "sl"}},
-                    reduce_only=True,
+                sl_res = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._exchange.order,
+                        self._symbol,
+                        sl_side,
+                        fill_size,
+                        stop_price,
+                        {"trigger": {"isMarket": True, "triggerPx": stop_price, "tpsl": "sl"}},
+                        reduce_only=True,
+                        cloid=sl_cloid,
+                    ),
+                    timeout=self.SL_CONFIRM_TIMEOUT_S,
                 )
-                logger.info("SL order result (attempt %d): %s @ %.1f", attempt, sl_res, stop_price)
+                if not (isinstance(sl_res, dict) and sl_res.get("status") == "ok"):
+                    raise RuntimeError(f"Exchange SL error: {sl_res}")
+                sl_statuses = sl_res.get("response", {}).get("data", {}).get("statuses", [{}])
+                sl_err = sl_statuses[0].get("error") if sl_statuses and isinstance(sl_statuses[0], dict) else None
+                if sl_err:
+                    raise RuntimeError(f"SL rechazado por el exchange: {sl_err}")
+                self._active_sl_oid = (
+                    sl_statuses[0].get("resting", {}).get("oid") if sl_statuses else None
+                )
+                sl_placed = True
+                logger.info("SL colocado (intento %d): %.1f (oid=%s)", attempt, stop_price, self._active_sl_oid)
+                break
+            except Exception as e:
+                logger.error("Colocación de SL intento %d/%d falló: %s", attempt, self.SL_MAX_RETRIES, e)
+                if attempt < self.SL_MAX_RETRIES:
+                    await asyncio.sleep(0.3)
 
-                # 2. Colocar Take Profit
-                tp_res = await asyncio.to_thread(
+        if not sl_placed:
+            logger.critical(
+                "EMERGENCY: no se pudo colocar el SL tras %d intentos. Cierre a mercado.",
+                self.SL_MAX_RETRIES,
+            )
+            await self._emergency_close(fill_size, "SL placement failed")
+            return
+
+        # ── Take Profit: deseable pero NO crítico (la posición YA tiene SL) ──
+        try:
+            tp_res = await asyncio.wait_for(
+                asyncio.to_thread(
                     self._exchange.order,
                     self._symbol,
                     tp_side,
@@ -529,66 +592,50 @@ class HyperliquidExecutor:
                     tp_price,
                     {"trigger": {"isMarket": True, "triggerPx": tp_price, "tpsl": "tp"}},
                     reduce_only=True,
-                )
-                logger.info("TP order result (attempt %d): %s @ %.1f", attempt, tp_res, tp_price)
-
-                # Verificar que AMBAS respuestas sean 'ok' y NO contengan 'error' en statuses
-                if not (isinstance(sl_res, dict) and sl_res.get("status") == "ok"):
-                    raise RuntimeError(f"Exchange SL error: {sl_res}")
-                if not (isinstance(tp_res, dict) and tp_res.get("status") == "ok"):
-                    raise RuntimeError(f"Exchange TP error: {tp_res}")
-
-                sl_data = sl_res.get("response", {}) if isinstance(sl_res.get("response"), dict) else {}
-                tp_data = tp_res.get("response", {}) if isinstance(tp_res.get("response"), dict) else {}
-
-                sl_statuses = sl_data.get("data", {}).get("statuses", [{}])
-                tp_statuses = tp_data.get("data", {}).get("statuses", [{}])
-
-                sl_err = sl_statuses[0].get("error") if sl_statuses and isinstance(sl_statuses[0], dict) else "No status"
-                tp_err = tp_statuses[0].get("error") if tp_statuses and isinstance(tp_statuses[0], dict) else "No status"
-
-                if sl_err or tp_err:
-                    raise RuntimeError(f"Rechazo en trigger orders -> SL_err={sl_err}, TP_err={tp_err}")
-
-                self._active_sl_oid = sl_statuses[0].get("resting", {}).get("oid") if sl_statuses else None
-                self._active_tp_oid = tp_statuses[0].get("resting", {}).get("oid") if tp_statuses else None
-
-                await self._sm.transition(
-                    ExecutorState.OPEN_PROTECTED,
-                    f"TP/SL placed: TP={tp_price:.1f}, SL={stop_price:.1f}",
-                )
-                logger.info(
-                    "Position PROTECTED: TP=%.1f (oid=%s), SL=%.1f (oid=%s)",
-                    tp_price, self._active_tp_oid,
-                    stop_price, self._active_sl_oid,
-                )
-
-                if self._alerter:
-                    side_lbl = "LONG 🟢" if is_buy_position else "SHORT 🔴"
-                    notional = fill_size * entry_price
-                    await self._alerter.send(
-                        f"✅ *POSICIÓN ABIERTA Y PROTEGIDA*\n"
-                        f"Lado: {side_lbl}\n"
-                        f"Tamaño: `{fill_size:.5f} BTC` (~${notional:.2f} USDC)\n"
-                        f"Entrada: `${entry_price:,.2f}`\n"
-                        f"🎯 Take Profit: `${tp_price:,.2f}`\n"
-                        f"🛑 Stop Loss: `${stop_price:,.2f}`",
-                        alert_type="FILL",
+                    cloid=tp_cloid,
+                ),
+                timeout=self.SL_CONFIRM_TIMEOUT_S,
+            )
+            if isinstance(tp_res, dict) and tp_res.get("status") == "ok":
+                tp_statuses = tp_res.get("response", {}).get("data", {}).get("statuses", [{}])
+                tp_err = tp_statuses[0].get("error") if tp_statuses and isinstance(tp_statuses[0], dict) else None
+                if not tp_err:
+                    self._active_tp_oid = (
+                        tp_statuses[0].get("resting", {}).get("oid") if tp_statuses else None
                     )
-                return
+                    logger.info("TP colocado: %.1f (oid=%s)", tp_price, self._active_tp_oid)
+                else:
+                    logger.warning("TP rechazado (no crítico, la posición ya tiene SL): %s", tp_err)
+            else:
+                logger.warning("TP no colocado (no crítico): %s", tp_res)
+        except Exception as e:
+            logger.warning("TP no colocado (no crítico): %s", e)
 
-            except Exception as e:
-                logger.error("TP/SL placement attempt %d/%d failed: %s", attempt, self.SL_MAX_RETRIES, e)
-
-            if attempt < self.SL_MAX_RETRIES:
-                await asyncio.sleep(1.0)
-
-        # EMERGENCIA: SL falló todos los intentos
-        logger.critical(
-            "EMERGENCY: Failed to place SL/TP after %d attempts. Closing position at market!",
-            self.SL_MAX_RETRIES,
+        # Transición y alerta FUERA del bucle de reintentos: evita que un error de
+        # formateo/log tras el éxito re-dispare la colocación o un cierre espurio.
+        await self._sm.transition(
+            ExecutorState.OPEN_PROTECTED,
+            f"SL={stop_price:.1f}, TP={tp_price:.1f}",
         )
-        await self._emergency_close(fill_size, "TP/SL placement failed")
+        logger.info(
+            "Position PROTECTED: SL=%.1f (oid=%s), TP=%.1f (oid=%s)",
+            stop_price, self._active_sl_oid, tp_price, self._active_tp_oid,
+        )
+        if self._alerter:
+            try:
+                side_lbl = "LONG 🟢" if is_buy_position else "SHORT 🔴"
+                notional = fill_size * entry_price
+                await self._alerter.send(
+                    f"✅ *POSICIÓN ABIERTA Y PROTEGIDA*\n"
+                    f"Lado: {side_lbl}\n"
+                    f"Tamaño: `{fill_size:.5f} BTC` (~${notional:.2f} USDC)\n"
+                    f"Entrada: `${entry_price:,.2f}`\n"
+                    f"🎯 Take Profit: `${tp_price:,.2f}`\n"
+                    f"🛑 Stop Loss: `${stop_price:,.2f}`",
+                    alert_type="FILL",
+                )
+            except Exception:
+                logger.exception("No se pudo enviar la alerta de posición protegida")
 
     async def on_tp_sl_trigger(self, trigger_type: str = "TP_OR_SL", fill_price: float = 0.0) -> None:
         """
@@ -908,11 +955,12 @@ class HyperliquidExecutor:
                 move_pct * 100, pnl_r, be_price, entry_price,
             )
             try:
-                if self._active_sl_oid:
-                    await asyncio.to_thread(
-                        self._exchange.cancel, self._symbol, int(self._active_sl_oid)
-                    )
                 sl_side = not is_long
+                old_sl_oid = self._active_sl_oid
+                # CORRECCIÓN (Track B): colocar el NUEVO SL primero y solo DESPUÉS
+                # cancelar el viejo. Antes se cancelaba primero → ventana sin stop, y
+                # si la colocación fallaba la posición quedaba sin SL con _moved_to_be
+                # marcado en True.
                 sl_res = await asyncio.to_thread(
                     self._exchange.order,
                     self._symbol,
@@ -922,10 +970,20 @@ class HyperliquidExecutor:
                     {"trigger": {"isMarket": True, "triggerPx": be_price, "tpsl": "sl"}},
                     reduce_only=True,
                 )
-                self._active_sl_oid = None
-                statuses = sl_res.get("response", {}).get("data", {}).get("statuses", [{}]) if isinstance(sl_res, dict) else [{}]
-                if statuses and isinstance(statuses[0], dict):
-                    self._active_sl_oid = statuses[0].get("resting", {}).get("oid")
+                if not (isinstance(sl_res, dict) and sl_res.get("status") == "ok"):
+                    raise RuntimeError(f"BE SL rechazado: {sl_res}")
+                statuses = sl_res.get("response", {}).get("data", {}).get("statuses", [{}])
+                be_err = statuses[0].get("error") if statuses and isinstance(statuses[0], dict) else None
+                if be_err:
+                    raise RuntimeError(f"BE SL error: {be_err}")
+                new_sl_oid = statuses[0].get("resting", {}).get("oid") if statuses and isinstance(statuses[0], dict) else None
+                # Nuevo SL confirmado → ahora sí cancelar el viejo.
+                if old_sl_oid:
+                    try:
+                        await asyncio.to_thread(self._exchange.cancel, self._symbol, int(old_sl_oid))
+                    except Exception:
+                        logger.exception("No se pudo cancelar el SL viejo tras colocar el nuevo (no crítico)")
+                self._active_sl_oid = new_sl_oid
                 self._moved_to_be = True
                 self._last_modify_at = time.monotonic()
                 if self._alerter:
@@ -937,7 +995,7 @@ class HyperliquidExecutor:
                         alert_type="INFO",
                     )
             except Exception:
-                logger.exception("Error aplicando break-even temprano")
+                logger.exception("Error aplicando break-even temprano (se mantiene el SL actual)")
 
         # ── 2. Cobro Rápido en Verde (solo para estrategias rápidas de 1m, NO para Kronos 30m) ──
         if strategy_name != "KronosFoundationStrategy" and elapsed_minutes >= 8.0 and move_pct >= 0.0015:
@@ -1064,3 +1122,6 @@ class HyperliquidExecutor:
                 )
             except InvalidTransitionError:
                 pass
+
+        # Ningún fill se completó por este camino: limpiar la orden de entrada activa.
+        self._clear_active_order()

@@ -8,6 +8,7 @@ Tests unitarios para HyperliquidExecutor:
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 import pytest
 
@@ -406,3 +407,88 @@ class TestExecutorExecution:
 
         assert sm.state != ExecutorState.FLAT
         assert abs(executor._filled_size - 0.001) < 1e-9
+
+    @pytest.mark.asyncio
+    async def test_place_tp_sl_protects_even_if_tp_fails(self):
+        """Regresión Track B: si el SL se coloca OK pero el TP falla, la posición
+        igual queda PROTEGIDA (el TP no es crítico). Antes, un TP rechazado forzaba
+        reintentos y un cierre de emergencia de una posición que ya tenía stop."""
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+
+        def order_side_effect(symbol, side, size, px, order_type, reduce_only=False, cloid=None):
+            if order_type.get("trigger", {}).get("tpsl") == "sl":
+                return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 111}}]}}}
+            return {"status": "err", "response": "tp boom"}
+
+        mock_exchange.order.side_effect = order_side_effect
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        executor._active_order = _make_sample_approved(OrderType.IOC)
+        await sm.transition(ExecutorState.ENTRY_PENDING, "t")
+        await sm.transition(ExecutorState.OPEN_UNPROTECTED, "t")
+
+        await executor._place_tp_sl_with_retry(76000.0, 0.0015)
+
+        assert sm.state == ExecutorState.OPEN_PROTECTED
+        assert executor._active_sl_oid == 111
+
+    @pytest.mark.asyncio
+    async def test_place_tp_sl_emergency_close_when_sl_fails(self):
+        """Regresión Track B: si el SL no se puede colocar, se cierra a mercado."""
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.order.return_value = {"status": "err", "response": "sl boom"}
+        mock_exchange.market_close.return_value = {"status": "ok", "response": {}}
+        mock_exchange.info.user_state.return_value = {"assetPositions": []}
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        executor._active_order = _make_sample_approved(OrderType.IOC)
+        await sm.transition(ExecutorState.ENTRY_PENDING, "t")
+        await sm.transition(ExecutorState.OPEN_UNPROTECTED, "t")
+
+        await executor._place_tp_sl_with_retry(76000.0, 0.0015)
+
+        mock_exchange.market_close.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_break_even_keeps_old_sl_if_new_placement_fails(self):
+        """Regresión Track B: si al mover a break-even la colocación del nuevo SL
+        falla, NO se cancela el SL viejo y _moved_to_be queda en False."""
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.order.return_value = {"status": "err", "response": "be boom"}
+        mock_exchange.cancel.return_value = {"status": "ok"}
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+        executor._active_order = _make_sample_approved(OrderType.IOC)
+        executor._filled_size = 0.001
+        executor._active_sl_oid = 123
+        executor._entry_time = time.monotonic()   # evita que se dispare el scalp-exit
+        await sm.transition(ExecutorState.ENTRY_PENDING, "t")
+        await sm.transition(ExecutorState.OPEN_PROTECTED, "t")
+
+        state = MagicMock()
+        state.account.position_entry_price = 76000.0
+        state.asset_ctx.mark_price = 76500.0   # +1R → dispara el intento de break-even
+
+        await executor.manage_open_position(state)
+
+        assert executor._moved_to_be is False
+        assert executor._active_sl_oid == 123          # SL viejo intacto
+        mock_exchange.cancel.assert_not_called()        # no se canceló el viejo
+
+    @pytest.mark.asyncio
+    async def test_ioc_no_fill_clears_active_order(self):
+        """Regresión Track B: una IOC sin fill limpia _active_order (para que un
+        fill tardío o la reconciliación no reutilicen SL/TP obsoletos)."""
+        sm = ExecutorStateMachine()
+        mock_exchange = MagicMock()
+        mock_exchange.market_open.return_value = {
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": []}},
+        }
+        executor = HyperliquidExecutor(mock_exchange, sm, symbol="BTC")
+
+        await executor.execute(_make_sample_approved(OrderType.IOC))
+
+        assert sm.state == ExecutorState.FLAT
+        assert executor._active_order is None
+        assert executor._active_entry_cloid is None

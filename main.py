@@ -212,6 +212,7 @@ async def main() -> None:
                 account_address=settings.hl_main_address,
             )
             executor = HyperliquidExecutor(exchange, state_machine, settings.trading_symbol)
+            executor.start_kill_flag_monitor()
             logger.info("Executor initialized (LIVE MODE)")
         except Exception:
             logger.exception("Failed to initialize executor — falling back to shadow mode")
