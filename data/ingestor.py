@@ -116,13 +116,33 @@ class HyperliquidIngestor:
 
             await self._subscribe(ws)
 
-            # Lanzar tareas concurrentes (gather en lugar de TaskGroup para evitar
-            # cancelación silenciosa si una sub-tarea falla)
-            await asyncio.gather(
-                self._message_loop(ws),
-                self._reconcile_loop(),
-                self._parquet_dump_loop(),
-            )
+            # Lanzar tareas concurrentes. Si CUALQUIERA termina (el message loop por
+            # desconexión, o una sub-tarea por error) se cancelan las demás, para no
+            # dejar loops huérfanos que se multiplican en cada reconexión (tormenta de
+            # cancelaciones) ni quedar sordos si el server cierra limpiamente el WS.
+            tasks = [
+                asyncio.create_task(self._message_loop(ws), name="ws_message_loop"),
+                asyncio.create_task(self._reconcile_loop(), name="ws_reconcile_loop"),
+                asyncio.create_task(self._parquet_dump_loop(), name="ws_parquet_loop"),
+            ]
+            try:
+                done, _pending = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Propagar el error de la tarea que terminó para que run() reconecte; si
+            # terminó sin error (p.ej. el server cerró el WS limpiamente), forzar la
+            # reconexión igualmente.
+            for t in done:
+                exc = t.exception()
+                if exc is not None:
+                    raise exc
+            raise ConnectionError("WebSocket message loop terminó — reconectando")
 
     async def _subscribe(self, ws: Any) -> None:
         """Suscribe a los 5 canales de Hyperliquid."""
